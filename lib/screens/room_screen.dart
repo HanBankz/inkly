@@ -1,10 +1,30 @@
 import 'package:flutter/material.dart';
 
-class RoomScreen extends StatelessWidget {
-  const RoomScreen({super.key});
+class RoomScreen extends StatefulWidget {
+  final String roomCode;
+  final bool isHost;
+
+  const RoomScreen({
+    super.key,
+    required this.roomCode,
+    required this.isHost,
+  });
 
   @override
-  Widget build(BuildContext context) {
-    return const Placeholder();
-  }
+  State<RoomScreen> createState() => _RoomScreenState();
 }
+
+class _RoomScreenState extends State<RoomScreen> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: Text(
+          'Room ${widget.roomCode} — Host: ${widget.isHost}',
+          style: const TextStyle(color: Colors.white),
+        ),
+      ),
+    );
+  }
+} 
