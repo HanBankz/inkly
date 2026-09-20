@@ -13,9 +13,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   // --- VARIABLES ZONE ---
   final TextEditingController _joinCodeController = TextEditingController();
-  bool _isCreating  = false;
+  bool _isCreating = false;
   bool _isJoining = false;
-
 
   // --- LIFECYCLE ZONE ---
   @override
@@ -23,12 +22,15 @@ class _HomeScreenState extends State<HomeScreen> {
     _joinCodeController.dispose();
     super.dispose();
   }
-    // --- LOGIC ZONE ---
+
+  // --- LOGIC ZONE ---
   String _generateRoomCode() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     final random = Random();
-    return List.generate(4, (index) => chars[random.nextInt(chars.length)])
-        .join();
+    return List.generate(
+      4,
+      (index) => chars[random.nextInt(chars.length)],
+    ).join();
   }
 
   Future<void> _createRoom() async {
@@ -51,12 +53,9 @@ class _HomeScreenState extends State<HomeScreen> {
         codeTaken = existing != null;
       } while (codeTaken);
 
-      await supabase.from('rooms').insert({
-        'code': code,
-        'host_id': userId,
-      });
+      await supabase.from('rooms').insert({'code': code, 'host_id': userId});
 
-      await supabase.from('room_participants').insert({
+      await supabase.from('room_participants').upsert({
         'room_code': code,
         'user_id': userId,
       });
@@ -69,9 +68,9 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not create room: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not create room: $e')));
     } finally {
       if (mounted) setState(() => _isCreating = false);
     }
@@ -83,28 +82,36 @@ class _HomeScreenState extends State<HomeScreen> {
 
     setState(() => _isJoining = true);
 
-    try{
+    try {
       final supabase = Supabase.instance.client;
       final userId = supabase.auth.currentUser!.id;
 
-      final room = await supabase .from('rooms')
+      final room = await supabase
+          .from('rooms')
           .select('code')
           .eq('code', code)
           .maybeSingle();
 
-          if (room == null) {
-            if (!mounted) return;
-          }
+      if (room == null) {
+        if (!mounted) return;
+      }
 
-          await supabase.from('room_participation').upsert({'room_code': code, 'user_id': userId,});
+      await supabase.from('room_participants').upsert({
+        'room_code': code,
+        'user_id': userId,
+      });
 
-          if(!mounted) return;
-          Navigator.of(context).push(MaterialPageRoute(builder: (context) => RoomScreen(roomCode: code, isHost: false),),);
-      } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not join room: $e')),
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (context) => RoomScreen(roomCode: code, isHost: false),
+        ),
       );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not join room: $e')));
     } finally {
       if (mounted) setState(() => _isJoining = false);
     }
@@ -178,8 +185,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   filled: true,
                   fillColor: Colors.white.withValues(alpha: 0.08),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 14,
+                  ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(30),
                     borderSide: BorderSide.none,

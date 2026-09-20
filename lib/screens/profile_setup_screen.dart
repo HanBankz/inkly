@@ -73,7 +73,9 @@ class _ProfileSetupScreenState extends State<ProfileSetupScreen>
     try {
       final supabase = Supabase.instance.client;
 
-      final authResponse = await supabase.auth.signInAnonymously();
+      final authResponse = await supabase.auth.signInAnonymously().timeout(
+        const Duration(seconds: 10),
+      );
       final userId = authResponse.user!.id;
 
       final colorHex =
