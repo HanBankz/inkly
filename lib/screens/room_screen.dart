@@ -17,8 +17,11 @@ class _RoomScreenState extends State<RoomScreen> {
   late final ScribbleNotifier _scribbleNotifier;
   late final RealtimeChannel _presenceChannel;
   List<Map<String, dynamic>> _connectedUsers = [];
+  RealtimeChannel? _strokeChannel;
+  int _knownLineCount = 0;
+  bool _isApplyingRemoteStroke = false;
 
-  // --- LIFECYCLE ZONE --- 
+  // --- LIFECYCLE ZONE ---
   @override
   void initState() {
     super.initState();
@@ -27,12 +30,17 @@ class _RoomScreenState extends State<RoomScreen> {
     _scribbleNotifier.setStrokeWidth(4);
     _scribbleNotifier.setAllowedPointersMode(ScribblePointerMode.all);
     _setupPresence();
+    _loadStrokeHistory();
+    _setupStrokeSync();
+    _scribbleNotifier.addListener(_onScribbleChanged);
   }
 
   @override
   void dispose() {
+    _scribbleNotifier.removeListener(_onScribbleChanged);
     _scribbleNotifier.dispose();
     _presenceChannel.unsubscribe();
+    _strokeChannel?.unsubscribe();
     super.dispose();
   }
 
@@ -69,6 +77,84 @@ class _RoomScreenState extends State<RoomScreen> {
           'avatar_color': profile['avatar_color'],
         });
       }
+    });
+  }
+
+  Future<void> _loadStrokeHistory() async {
+    final supabase = Supabase.instance.client;
+
+    final rows = await supabase
+        .from('strokes')
+        .select('stroke_data')
+        .eq('room_code', widget.roomCode)
+        .order('created_at');
+
+    final lines = rows
+        .map((row) => SketchLine.fromJson(row['stroke_data']))
+        .toList();
+
+    _isApplyingRemoteStroke = true;
+    _scribbleNotifier.setSketch(
+      sketch: Sketch(lines: lines),
+      addToUndoHistory: false,
+    );
+    _isApplyingRemoteStroke = false;
+    _knownLineCount = lines.length;
+  }
+
+  void _setupStrokeSync() {
+    _strokeChannel = Supabase.instance.client.channel(
+      'strokes:${widget.roomCode}',
+    );
+
+    _strokeChannel!.onBroadcast(
+      event: 'stroke',
+      callback: (payload) {
+        final line = SketchLine.fromJson(payload);
+        final updatedLines = [..._scribbleNotifier.currentSketch.lines, line];
+
+        _isApplyingRemoteStroke = true;
+        _scribbleNotifier.setSketch(
+          sketch: Sketch(lines: updatedLines),
+          addToUndoHistory: false,
+        );
+        _isApplyingRemoteStroke = false;
+        _knownLineCount = updatedLines.length;
+      },
+    );
+
+    _strokeChannel!.subscribe();
+  }
+
+  void _onScribbleChanged() {
+    if (_isApplyingRemoteStroke) return;
+
+    final currentLines = _scribbleNotifier.currentSketch.lines;
+    if (currentLines.length > _knownLineCount) {
+      final newLines = currentLines.sublist(_knownLineCount);
+      for (final line in newLines) {
+        _broadcastStroke(line);
+        _saveStroke(line);
+      }
+    }
+    _knownLineCount = currentLines.length;
+  }
+
+  void _broadcastStroke(SketchLine line) {
+    _strokeChannel?.sendBroadcastMessage(
+      event: 'stroke',
+      payload: line.toJson(),
+    );
+  }
+
+  Future<void> _saveStroke(SketchLine line) async {
+    final supabase = Supabase.instance.client;
+    final userId = supabase.auth.currentUser!.id;
+
+    await supabase.from('strokes').insert({
+      'room_code': widget.roomCode,
+      'user_id': userId,
+      'stroke_data': line.toJson(),
     });
   }
 
