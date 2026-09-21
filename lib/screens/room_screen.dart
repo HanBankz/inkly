@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:scribble/scribble.dart';
+import 'package:uuid/uuid.dart';
 
 class RoomScreen extends StatefulWidget {
   final String roomCode;
@@ -20,6 +21,9 @@ class _RoomScreenState extends State<RoomScreen> {
   RealtimeChannel? _strokeChannel;
   int _knownLineCount = 0;
   bool _isApplyingRemoteStroke = false;
+  final Uuid _uuid = const Uuid();
+  final List<Map<String, dynamic>> _canvasStrokes = [];
+  final List<Map<String, dynamic>> _redoStack = [];
 
   // --- LIFECYCLE ZONE ---
   @override
@@ -85,13 +89,24 @@ class _RoomScreenState extends State<RoomScreen> {
 
     final rows = await supabase
         .from('strokes')
-        .select('stroke_data')
+        .select()
         .eq('room_code', widget.roomCode)
         .order('created_at');
 
-    final lines = rows
-        .map((row) => SketchLine.fromJson(row['stroke_data']))
-        .toList();
+    _canvasStrokes.clear();
+    for (final row in rows) {
+      _canvasStrokes.add({
+        'id': row['id'],
+        'user_id': row['user_id'],
+        'line': SketchLine.fromJson(row['stroke_data']),
+      });
+    }
+
+    _rebuildCanvas();
+  }
+
+  void _rebuildCanvas() {
+    final lines = _canvasStrokes.map((s) => s['line'] as SketchLine).toList();
 
     _isApplyingRemoteStroke = true;
     _scribbleNotifier.setSketch(
@@ -108,18 +123,31 @@ class _RoomScreenState extends State<RoomScreen> {
     );
 
     _strokeChannel!.onBroadcast(
-      event: 'stroke',
+      event: 'stroke_added',
       callback: (payload) {
-        final line = SketchLine.fromJson(payload);
-        final updatedLines = [..._scribbleNotifier.currentSketch.lines, line];
+        _canvasStrokes.add({
+          'id': payload['id'],
+          'user_id': payload['user_id'],
+          'line': SketchLine.fromJson(payload['line']),
+        });
+        _rebuildCanvas();
+      },
+    );
 
-        _isApplyingRemoteStroke = true;
-        _scribbleNotifier.setSketch(
-          sketch: Sketch(lines: updatedLines),
-          addToUndoHistory: false,
-        );
-        _isApplyingRemoteStroke = false;
-        _knownLineCount = updatedLines.length;
+    _strokeChannel!.onBroadcast(
+      event: 'stroke_removed',
+      callback: (payload) {
+        _canvasStrokes.removeWhere((s) => s['id'] == payload['id']);
+        _rebuildCanvas();
+      },
+    );
+
+    _strokeChannel!.onBroadcast(
+      event: 'canvas_cleared',
+      callback: (payload) {
+        _canvasStrokes.clear();
+        _redoStack.clear();
+        _rebuildCanvas();
       },
     );
 
@@ -133,27 +161,74 @@ class _RoomScreenState extends State<RoomScreen> {
     if (currentLines.length > _knownLineCount) {
       final newLines = currentLines.sublist(_knownLineCount);
       for (final line in newLines) {
-        _broadcastStroke(line);
-        _saveStroke(line);
+        _addNewStroke(line);
       }
     }
     _knownLineCount = currentLines.length;
   }
 
-  void _broadcastStroke(SketchLine line) {
-    _strokeChannel?.sendBroadcastMessage(
-      event: 'stroke',
-      payload: line.toJson(),
-    );
-  }
-
-  Future<void> _saveStroke(SketchLine line) async {
+  void _addNewStroke(SketchLine line) {
     final supabase = Supabase.instance.client;
     final userId = supabase.auth.currentUser!.id;
+    final strokeId = _uuid.v4();
 
-    await supabase.from('strokes').insert({
+    _canvasStrokes.add({'id': strokeId, 'user_id': userId, 'line': line});
+    _redoStack.clear();
+    _knownLineCount = _canvasStrokes.length;
+
+    _strokeChannel?.sendBroadcastMessage(
+      event: 'stroke_added',
+      payload: {'id': strokeId, 'user_id': userId, 'line': line.toJson()},
+    );
+
+    supabase.from('strokes').insert({
+      'id': strokeId,
       'room_code': widget.roomCode,
       'user_id': userId,
+      'stroke_data': line.toJson(),
+    });
+  }
+
+  void _undoMyLastStroke() {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+
+    final index = _canvasStrokes.lastIndexWhere((s) => s['user_id'] == userId);
+    if (index == -1) return;
+
+    final removed = _canvasStrokes.removeAt(index);
+    _redoStack.add(removed);
+    _rebuildCanvas();
+
+    _strokeChannel?.sendBroadcastMessage(
+      event: 'stroke_removed',
+      payload: {'id': removed['id']},
+    );
+
+    Supabase.instance.client.from('strokes').delete().eq('id', removed['id']);
+  }
+
+  void _redoMyLastStroke() {
+    if (_redoStack.isEmpty) return;
+
+    final restored = _redoStack.removeLast();
+    _canvasStrokes.add(restored);
+    _rebuildCanvas();
+
+    final line = restored['line'] as SketchLine;
+
+    _strokeChannel?.sendBroadcastMessage(
+      event: 'stroke_added',
+      payload: {
+        'id': restored['id'],
+        'user_id': restored['user_id'],
+        'line': line.toJson(),
+      },
+    );
+
+    Supabase.instance.client.from('strokes').insert({
+      'id': restored['id'],
+      'room_code': widget.roomCode,
+      'user_id': restored['user_id'],
       'stroke_data': line.toJson(),
     });
   }
@@ -208,8 +283,14 @@ class _RoomScreenState extends State<RoomScreen> {
                         children: [
                           FloatingActionButton.small(
                             heroTag: 'undo',
-                            onPressed: () => _scribbleNotifier.undo(),
+                            onPressed: _undoMyLastStroke,
                             child: const Icon(Icons.undo),
+                          ),
+                          const SizedBox(height: 8),
+                          FloatingActionButton.small(
+                            heroTag: 'redo',
+                            onPressed: _redoMyLastStroke,
+                            child: const Icon(Icons.redo),
                           ),
                           const SizedBox(height: 8),
                           FloatingActionButton.small(
