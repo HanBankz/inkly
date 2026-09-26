@@ -94,12 +94,26 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (room == null) {
         if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              "That room doesn't exist. Check the code and try again.",
+            ),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            margin: const EdgeInsets.all(16),
+          ),
+        );
+        return;
       }
 
       await supabase.from('room_participants').upsert({
         'room_code': code,
         'user_id': userId,
-      });
+      }, onConflict: 'room_code,user_id');
 
       if (!mounted) return;
       Navigator.of(context).push(

@@ -2,6 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:scribble/scribble.dart';
 import 'package:uuid/uuid.dart';
+import 'package:saver_gallery/saver_gallery.dart';
+import 'dart:ui' as ui;
+import 'dart:math' as math;
+import 'dart:async';
+
+enum ToolType { brush, eraser, rectangle, circle, line, text, eyedropper, blur }
 
 class RoomScreen extends StatefulWidget {
   final String roomCode;
@@ -17,13 +23,47 @@ class _RoomScreenState extends State<RoomScreen> {
   // --- VARIABLES ZONE ---
   late final ScribbleNotifier _scribbleNotifier;
   late final RealtimeChannel _presenceChannel;
+
   List<Map<String, dynamic>> _connectedUsers = [];
   RealtimeChannel? _strokeChannel;
   int _knownLineCount = 0;
   bool _isApplyingRemoteStroke = false;
+
   final Uuid _uuid = const Uuid();
   final List<Map<String, dynamic>> _canvasStrokes = [];
   final List<Map<String, dynamic>> _redoStack = [];
+
+  RealtimeChannel? _cursorChannel;
+  Map<String, Map<String, dynamic>> _remoteCursors = {};
+  final GlobalKey _canvasKey = GlobalKey();
+  int _lastCursorSentAt = 0;
+  String _myName = '';
+  String _myColorHex = '#7C5CFF';
+
+  bool _toolsExpanded = false;
+  ToolType _currentTool = ToolType.brush;
+  double _brushOpacity = 1.0;
+  final TransformationController _zoomController = TransformationController();
+
+  Offset? _shapeStart;
+  Offset? _shapeCurrent;
+
+  bool get _isShapeTool =>
+      _currentTool == ToolType.rectangle ||
+      _currentTool == ToolType.circle ||
+      _currentTool == ToolType.line;
+
+  final List<Map<String, dynamic>> _canvasTexts = [];
+  RealtimeChannel? _textChannel;
+
+  Offset? _pendingTextPosition;
+  TextEditingController? _pendingTextController;
+  String? _draggingTextId;
+  Offset? _dragOriginalPosition;
+  bool _textDidMove = false;
+  FocusNode? _pendingTextFocusNode;
+  Timer? _textDeleteTimer;
+  bool _blockCanvasForText = false;
 
   // --- LIFECYCLE ZONE ---
   @override
@@ -36,6 +76,9 @@ class _RoomScreenState extends State<RoomScreen> {
     _setupPresence();
     _loadStrokeHistory();
     _setupStrokeSync();
+    _setupCursorSync();
+    _setupTextSync();
+    _loadTextHistory();
     _scribbleNotifier.addListener(_onScribbleChanged);
   }
 
@@ -45,6 +88,10 @@ class _RoomScreenState extends State<RoomScreen> {
     _scribbleNotifier.dispose();
     _presenceChannel.unsubscribe();
     _strokeChannel?.unsubscribe();
+    _cursorChannel?.unsubscribe();
+    _pendingTextController?.dispose();
+    _pendingTextFocusNode?.dispose();
+    _textDeleteTimer?.cancel();
     super.dispose();
   }
 
@@ -58,6 +105,9 @@ class _RoomScreenState extends State<RoomScreen> {
         .select()
         .eq('id', userId)
         .single();
+
+    _myName = profile['display_name'];
+    _myColorHex = profile['avatar_color'];
 
     _presenceChannel = supabase.channel('room:${widget.roomCode}');
 
@@ -167,7 +217,7 @@ class _RoomScreenState extends State<RoomScreen> {
     _knownLineCount = currentLines.length;
   }
 
-  void _addNewStroke(SketchLine line) {
+  Future<void> _addNewStroke(SketchLine line) async {
     final supabase = Supabase.instance.client;
     final userId = supabase.auth.currentUser!.id;
     final strokeId = _uuid.v4();
@@ -181,15 +231,20 @@ class _RoomScreenState extends State<RoomScreen> {
       payload: {'id': strokeId, 'user_id': userId, 'line': line.toJson()},
     );
 
-    supabase.from('strokes').insert({
-      'id': strokeId,
-      'room_code': widget.roomCode,
-      'user_id': userId,
-      'stroke_data': line.toJson(),
-    });
+    try {
+      // CHANGED: added await + try/catch so a failed insert is never silent
+      await supabase.from('strokes').insert({
+        'id': strokeId,
+        'room_code': widget.roomCode,
+        'user_id': userId,
+        'stroke_data': line.toJson(),
+      });
+    } catch (e) {
+      debugPrint('Failed to save stroke: $e');
+    }
   }
 
-  void _undoMyLastStroke() {
+  Future<void> _undoMyLastStroke() async {
     final userId = Supabase.instance.client.auth.currentUser!.id;
 
     final index = _canvasStrokes.lastIndexWhere((s) => s['user_id'] == userId);
@@ -204,10 +259,18 @@ class _RoomScreenState extends State<RoomScreen> {
       payload: {'id': removed['id']},
     );
 
-    Supabase.instance.client.from('strokes').delete().eq('id', removed['id']);
+    try {
+      // CHANGED: added await + try/catch so a failed delete is never silent
+      await Supabase.instance.client
+          .from('strokes')
+          .delete()
+          .eq('id', removed['id']);
+    } catch (e) {
+      debugPrint('Failed to delete stroke: $e');
+    }
   }
 
-  void _redoMyLastStroke() {
+  Future<void> _redoMyLastStroke() async {
     if (_redoStack.isEmpty) return;
 
     final restored = _redoStack.removeLast();
@@ -225,12 +288,549 @@ class _RoomScreenState extends State<RoomScreen> {
       },
     );
 
-    Supabase.instance.client.from('strokes').insert({
-      'id': restored['id'],
-      'room_code': widget.roomCode,
-      'user_id': restored['user_id'],
-      'stroke_data': line.toJson(),
+    try {
+      // CHANGED: added await + try/catch so a failed insert is never silent
+      await Supabase.instance.client.from('strokes').insert({
+        'id': restored['id'],
+        'room_code': widget.roomCode,
+        'user_id': restored['user_id'],
+        'stroke_data': line.toJson(),
+      });
+    } catch (e) {
+      debugPrint('Failed to restore stroke: $e');
+    }
+  }
+
+  Future<void> _hostUndoLastStroke() async {
+    if (_canvasStrokes.isEmpty) return;
+
+    final removed = _canvasStrokes.removeLast();
+    _rebuildCanvas();
+
+    _strokeChannel?.sendBroadcastMessage(
+      event: 'stroke_removed',
+      payload: {'id': removed['id']},
+    );
+
+    try {
+      await Supabase.instance.client
+          .from('strokes')
+          .delete()
+          .eq('id', removed['id']);
+    } catch (e) {
+      debugPrint('Host undo failed: $e');
+    }
+  }
+
+  Future<void> _clearCanvas() async {
+    _canvasStrokes.clear();
+    _redoStack.clear();
+    _rebuildCanvas();
+
+    _strokeChannel?.sendBroadcastMessage(event: 'canvas_cleared', payload: {});
+
+    try {
+      await Supabase.instance.client
+          .from('strokes')
+          .delete()
+          .eq('room_code', widget.roomCode);
+    } catch (e) {
+      debugPrint('clear canvas failed: $e');
+    }
+  }
+
+  Future<void> _exportCanvas() async {
+    try {
+      final rawBytes = await _scribbleNotifier.renderImage(pixelRatio: 2.0);
+      final codec = await ui.instantiateImageCodec(
+        rawBytes.buffer.asUint8List(),
+      );
+      final frame = await codec.getNextFrame();
+      final original = frame.image;
+
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      final paint = Paint()..color = const Color(0xFFF5F5F5);
+      canvas.drawRect(
+        Rect.fromLTWH(
+          0,
+          0,
+          original.width.toDouble(),
+          original.height.toDouble(),
+        ),
+        paint,
+      );
+      canvas.drawImage(original, Offset.zero, Paint());
+
+      final picture = recorder.endRecording();
+      final finalImage = await picture.toImage(original.width, original.height);
+      final finalBytes = await finalImage.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+
+      final result = await SaverGallery.saveImage(
+        finalBytes!.buffer.asUint8List(),
+        fileName:
+            'inkly_${widget.roomCode}_${DateTime.now().millisecondsSinceEpoch}',
+        skipIfExists: false,
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result.isSuccess ? 'Saved to gallery' : 'Failed to save image',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Export failed: $e')));
+    }
+  }
+
+  void _confirmClearCanvas() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear the canvas for everyone?'),
+        content: const Text('This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _clearCanvas();
+            },
+            child: const Text('Clear', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _selectTool(ToolType tool) {
+    if (_pendingTextPosition != null) _commitPendingText();
+    setState(() {
+      _currentTool = tool;
+      _toolsExpanded = false;
     });
+
+    switch (tool) {
+      case ToolType.brush:
+        _scribbleNotifier.setColor(
+          Color(
+            int.parse(_myColorHex.replaceFirst('#', '0xFF')),
+          ).withValues(alpha: _brushOpacity),
+        );
+        break;
+      case ToolType.eraser:
+        _scribbleNotifier.setEraser();
+        break;
+      case ToolType.rectangle:
+      case ToolType.circle:
+      case ToolType.line:
+        // Shape drawing logic — next category
+        break;
+      case ToolType.text:
+        // Text placement logic — next category
+        break;
+      case ToolType.eyedropper:
+        break;
+      case ToolType.blur:
+        // Blur logic — next category
+        break;
+    }
+  }
+
+  List<Point> _interpolatePoints(Offset a, Offset b, int steps) {
+    return [
+      for (int i = 0; i <= steps; i++)
+        Point(
+          a.dx + (b.dx - a.dx) * (i / steps),
+          a.dy + (b.dy - a.dy) * (i / steps),
+        ),
+    ];
+  }
+
+  List<Point> _generateShapePoints(ToolType tool, Offset start, Offset end) {
+    switch (tool) {
+      case ToolType.line:
+        return _interpolatePoints(start, end, 24);
+
+      case ToolType.rectangle:
+        final topLeft = start;
+        final topRight = Offset(end.dx, start.dy);
+        final bottomRight = end;
+        final bottomLeft = Offset(start.dx, end.dy);
+
+        return [
+          ..._interpolatePoints(topLeft, topRight, 15),
+          ...List.filled(5, Point(topRight.dx, topRight.dy)),
+          ..._interpolatePoints(topRight, bottomRight, 15),
+          ...List.filled(5, Point(bottomRight.dx, bottomRight.dy)),
+          ..._interpolatePoints(bottomRight, bottomLeft, 15),
+          ...List.filled(5, Point(bottomLeft.dx, bottomLeft.dy)),
+          ..._interpolatePoints(bottomLeft, topLeft, 15),
+          ...List.filled(8, Point(topLeft.dx, topLeft.dy)),
+        ];
+
+      case ToolType.circle:
+        final centerX = (start.dx + end.dx) / 2;
+        final centerY = (start.dy + end.dy) / 2;
+        final radiusX = (end.dx - start.dx).abs() / 2;
+        final radiusY = (end.dy - start.dy).abs() / 2;
+        return [
+          for (int i = 0; i <= 56; i++)
+            Point(
+              centerX + radiusX * math.cos(2 * math.pi * i / 48),
+              centerY + radiusY * math.sin(2 * math.pi * i / 48),
+            ),
+        ];
+      default:
+        return [];
+    }
+  }
+
+  void _startShape(Offset position) {
+    setState(() {
+      _shapeStart = position;
+      _shapeCurrent = position;
+    });
+  }
+
+  void _updateShape(Offset position) {
+    setState(() {
+      _shapeCurrent = position;
+    });
+  }
+
+  void _finishShape() {
+    if (_shapeStart == null || _shapeCurrent == null) return;
+
+    final points = _generateShapePoints(
+      _currentTool,
+      _shapeStart!,
+      _shapeCurrent!,
+    );
+    if (points.isNotEmpty) {
+      final line = SketchLine(
+        points: points,
+        color: Color(
+          int.parse(_myColorHex.replaceFirst('#', '0xFF')),
+        ).withValues(alpha: _brushOpacity).toARGB32(),
+        width: 4,
+      );
+
+      _addNewStroke(line);
+      _rebuildCanvas();
+    }
+
+    setState(() {
+      _shapeStart = null;
+      _shapeCurrent = null;
+    });
+  }
+
+  Future<void> _pickColorAt(Offset position) async {
+    try {
+      final bytes = await _scribbleNotifier.renderImage(pixelRatio: 1.0);
+      final codec = await ui.instantiateImageCodec(bytes.buffer.asUint8List());
+      final frame = await codec.getNextFrame();
+      final image = frame.image;
+
+      final byteData = await image.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      );
+      if (byteData == null) return;
+
+      final x = position.dx.round().clamp(0, image.width - 1);
+      final y = position.dy.round().clamp(0, image.height - 1);
+      final pixelIndex = (y * image.width + x) * 4;
+
+      final r = byteData.getUint8(pixelIndex);
+      final g = byteData.getUint8(pixelIndex + 1);
+      final b = byteData.getUint8(pixelIndex + 2);
+      final a = byteData.getUint8(pixelIndex + 3);
+
+      if (a == 0) return;
+
+      final pickedColor = Color.fromARGB(a, r, g, b);
+      final hex = '#${pickedColor.toARGB32().toRadixString(16).substring(2)}';
+
+      setState(() {
+        _myColorHex = hex;
+        _currentTool = ToolType.brush;
+      });
+
+      _scribbleNotifier.setColor(pickedColor.withValues(alpha: _brushOpacity));
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              Container(width: 20, height: 20, color: pickedColor),
+              const SizedBox(width: 12),
+              Text('Color picked: $hex'),
+            ],
+          ),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      debugPrint('Eyedropper failed: $e');
+    }
+  }
+
+  void _setupTextSync() {
+    _textChannel = Supabase.instance.client.channel('texts:${widget.roomCode}');
+
+    _textChannel!.onBroadcast(
+      event: 'text_added',
+      callback: (payload) {
+        setState(() => _canvasTexts.add(payload));
+      },
+    );
+
+    _textChannel!.onBroadcast(
+      event: 'text_moved',
+      callback: (payload) {
+        setState(() {
+          final index = _canvasTexts.indexWhere(
+            (t) => t['id'] == payload['id'],
+          );
+          if (index != -1) {
+            _canvasTexts[index] = {
+              ..._canvasTexts[index],
+              'pos_x': payload['pos_x'],
+              'pos_y': payload['pos_y'],
+            };
+          }
+        });
+      },
+    );
+
+    _textChannel!.onBroadcast(
+      event: 'text_removed',
+      callback: (payload) {
+        setState(() {
+          _canvasTexts.removeWhere((t) => t['id'] == payload['id']);
+        });
+      },
+    );
+
+    _textChannel!.subscribe();
+  }
+
+  Future<void> _loadTextHistory() async {
+    final rows = await Supabase.instance.client
+        .from('canvas_texts')
+        .select()
+        .eq('room_code', widget.roomCode);
+
+    setState(() {
+      _canvasTexts.clear();
+      _canvasTexts.addAll(rows.map((r) => Map<String, dynamic>.from(r)));
+    });
+  }
+
+  void _startTextEntry(Offset position) {
+    setState(() {
+      _pendingTextPosition = position;
+      _pendingTextController = TextEditingController();
+      _pendingTextFocusNode = FocusNode();
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _pendingTextFocusNode?.requestFocus();
+    });
+  }
+
+  void _handleTextTap(Offset position) {
+    if (_pendingTextPosition != null) {
+      _commitPendingText();
+    }
+    _startTextEntry(position);
+  }
+
+  Future<void> _commitPendingText() async {
+    final content = _pendingTextController?.text.trim() ?? '';
+    final position = _pendingTextPosition;
+
+    _pendingTextController?.dispose();
+    _pendingTextFocusNode?.dispose();
+
+    setState(() {
+      _pendingTextPosition = null;
+      _pendingTextController = null;
+      _pendingTextFocusNode = null;
+    });
+
+    if (content.isEmpty || position == null) return;
+
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    final id = _uuid.v4();
+    final data = {
+      'id': id,
+      'user_id': userId,
+      'content': content,
+      'pos_x': position.dx,
+      'pos_y': position.dy,
+      'color': _myColorHex,
+    };
+
+    setState(() => _canvasTexts.add(data));
+
+    _textChannel?.sendBroadcastMessage(event: 'text_added', payload: data);
+
+    try {
+      await Supabase.instance.client.from('canvas_texts').insert({
+        ...data,
+        'room_code': widget.roomCode,
+      });
+    } catch (e) {
+      debugPrint('Failed to save text: $e');
+    }
+  }
+
+  Future<void> _moveText(String id, Offset newPosition) async {
+    setState(() {
+      final index = _canvasTexts.indexWhere((t) => t['id'] == id);
+      if (index != -1) {
+        _canvasTexts[index] = {
+          ..._canvasTexts[index],
+          'pos_x': newPosition.dx,
+          'pos_y': newPosition.dy,
+        };
+      }
+    });
+
+    _textChannel?.sendBroadcastMessage(
+      event: 'text_moved',
+      payload: {'id': id, 'pos_x': newPosition.dx, 'pos_y': newPosition.dy},
+    );
+
+    try {
+      await Supabase.instance.client
+          .from('canvas_texts')
+          .update({'pos_x': newPosition.dx, 'pos_y': newPosition.dy})
+          .eq('id', id);
+    } catch (e) {
+      debugPrint('Failed to move text: $e');
+    }
+  }
+
+  Future<void> _deleteText(Map<String, dynamic> text) async {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    final isOwner = text['user_id'] == userId;
+
+    if (!isOwner && !widget.isHost) return;
+
+    setState(() {
+      _canvasTexts.removeWhere((t) => t['id'] == text['id']);
+    });
+
+    _textChannel?.sendBroadcastMessage(
+      event: 'text_removed',
+      payload: {'id': text['id']},
+    );
+
+    try {
+      await Supabase.instance.client
+          .from('canvas_texts')
+          .delete()
+          .eq('id', text['id']);
+    } catch (e) {
+      debugPrint('Failed to delete text: $e');
+    }
+  }
+
+  void _confirmDeleteText(Map<String, dynamic> text) {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    final isOwner = text['user_id'] == userId;
+    if (!isOwner && !widget.isHost) return;
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete this text?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _deleteText(text);
+            },
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _setupCursorSync() {
+    _cursorChannel = Supabase.instance.client.channel(
+      'cursors:${widget.roomCode}',
+    );
+
+    _cursorChannel!.onBroadcast(
+      event: 'cursor_move',
+      callback: (payload) {
+        setState(() {
+          _remoteCursors[payload['user_id']] = payload;
+        });
+      },
+    );
+
+    _cursorChannel!.onBroadcast(
+      event: 'cursor_up',
+      callback: (payload) {
+        setState(() {
+          _remoteCursors.remove(payload['user_id']);
+        });
+      },
+    );
+
+    _cursorChannel!.subscribe();
+  }
+
+  void _handlePointerMove(PointerEvent event) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastCursorSentAt < 50) return;
+    _lastCursorSentAt = now;
+
+    final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final local = box.globalToLocal(event.position);
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+
+    _cursorChannel?.sendBroadcastMessage(
+      event: 'cursor_move',
+      payload: {
+        'user_id': userId,
+        'name': _myName,
+        'color': _myColorHex,
+        'x': local.dx / box.size.width,
+        'y': local.dy / box.size.height,
+      },
+    );
+  }
+
+  void _handlePointerUp(PointerEvent event) {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    _cursorChannel?.sendBroadcastMessage(
+      event: 'cursor_up',
+      payload: {'user_id': userId},
+    );
   }
 
   // --- UI ZONE ---
@@ -262,6 +862,19 @@ class _RoomScreenState extends State<RoomScreen> {
                     ),
                   ),
                   _buildAvatarStack(),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    onPressed: _exportCanvas,
+                    icon: const Icon(Icons.download, color: Colors.white70),
+                  ),
+                  if (widget.isHost)
+                    IconButton(
+                      onPressed: _confirmClearCanvas,
+                      icon: const Icon(
+                        Icons.delete_forever,
+                        color: Colors.redAccent,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -271,38 +884,380 @@ class _RoomScreenState extends State<RoomScreen> {
                 child: Stack(
                   children: [
                     Positioned.fill(
-                      child: Scribble(
-                        notifier: _scribbleNotifier,
-                        drawPen: true,
+                      child: InteractiveViewer(
+                        transformationController: _zoomController,
+                        minScale: 1.0,
+                        maxScale: 4.0,
+                        child: Center(
+                          child: FittedBox(
+                            fit: BoxFit.contain,
+                            child: SizedBox(
+                              width: 1080,
+                              height: 2300,
+                              child: Listener(
+                                onPointerMove: _handlePointerMove,
+                                onPointerUp: _handlePointerUp,
+                                child: Stack(
+                                  key: _canvasKey,
+                                  children: [
+                                    Positioned.fill(
+                                      child: IgnorePointer(
+                                        ignoring:
+                                            _isShapeTool ||
+                                            _currentTool == ToolType.text ||
+                                            _currentTool ==
+                                                ToolType.eyedropper ||
+                                            _blockCanvasForText,
+                                        child: Scribble(
+                                          notifier: _scribbleNotifier,
+                                          drawPen: true,
+                                        ),
+                                      ),
+                                    ),
+                                    if (_isShapeTool)
+                                      Positioned.fill(
+                                        child: GestureDetector(
+                                          onPanStart: (details) => _startShape(
+                                            details.localPosition,
+                                          ),
+                                          onPanUpdate: (details) =>
+                                              _updateShape(
+                                                details.localPosition,
+                                              ),
+                                          onPanEnd: (_) => _finishShape(),
+                                          child: CustomPaint(
+                                            painter: _ShapePreviewPainter(
+                                              tool: _currentTool,
+                                              start: _shapeStart,
+                                              current: _shapeCurrent,
+                                              color: Color(
+                                                int.parse(
+                                                  _myColorHex.replaceFirst(
+                                                    '#',
+                                                    '0xFF',
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    if (_currentTool == ToolType.text)
+                                      Positioned.fill(
+                                        child: GestureDetector(
+                                          onTapUp: (details) => _handleTextTap(
+                                            details.localPosition,
+                                          ),
+                                        ),
+                                      ),
+                                    if (_currentTool == ToolType.eyedropper)
+                                      Positioned.fill(
+                                        child: GestureDetector(
+                                          onTapUp: (details) => _pickColorAt(
+                                            details.localPosition,
+                                          ),
+                                        ),
+                                      ),
+                                    if (_pendingTextPosition != null)
+                                      Positioned(
+                                        left: _pendingTextPosition!.dx,
+                                        top: _pendingTextPosition!.dy,
+                                        child: IntrinsicWidth(
+                                          child: TextField(
+                                            controller: _pendingTextController,
+                                            focusNode: _pendingTextFocusNode,
+                                            autofocus: true,
+                                            style: TextStyle(
+                                              color: Color(
+                                                int.parse(
+                                                  _myColorHex.replaceFirst(
+                                                    '#',
+                                                    '0xFF',
+                                                  ),
+                                                ),
+                                              ),
+                                              fontSize: 24,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                            decoration: const InputDecoration(
+                                              border: InputBorder.none,
+                                              isDense: true,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    for (final text in _canvasTexts)
+                                      Positioned(
+                                        left: text['pos_x'],
+                                        top: text['pos_y'],
+                                        child: Listener(
+                                          behavior: HitTestBehavior.opaque,
+                                          onPointerDown: (event) {
+                                            setState(
+                                              () => _blockCanvasForText = true,
+                                            );
+                                            _draggingTextId = text['id'];
+                                            _dragOriginalPosition = Offset(
+                                              text['pos_x'],
+                                              text['pos_y'],
+                                            );
+                                            _textDidMove = false;
+                                            _textDeleteTimer?.cancel();
+                                            _textDeleteTimer = Timer(
+                                              const Duration(milliseconds: 500),
+                                              () {
+                                                if (_draggingTextId ==
+                                                        text['id'] &&
+                                                    !_textDidMove) {
+                                                  _confirmDeleteText(text);
+                                                }
+                                              },
+                                            );
+                                          },
+                                          onPointerMove: (event) {
+                                            if (_draggingTextId != text['id']) {
+                                              return;
+                                            }
+                                            if (!_textDidMove &&
+                                                event.delta.distance > 2) {
+                                              _textDidMove = true;
+                                              _textDeleteTimer?.cancel();
+                                            }
+                                            if (_textDidMove) {
+                                              final current = Offset(
+                                                text['pos_x'],
+                                                text['pos_y'],
+                                              );
+                                              _moveText(
+                                                text['id'],
+                                                current + event.delta,
+                                              );
+                                            }
+                                          },
+                                          onPointerUp: (event) {
+                                            _textDeleteTimer?.cancel();
+                                            _draggingTextId = null;
+                                            setState(
+                                              () => _blockCanvasForText = false,
+                                            );
+                                          },
+                                          child: Container(
+                                            padding: const EdgeInsets.all(12),
+                                            child: Text(
+                                              text['content'],
+                                              style: TextStyle(
+                                                color: Color(
+                                                  int.parse(
+                                                    (text['color'] as String)
+                                                        .replaceFirst(
+                                                          '#',
+                                                          '0xFF',
+                                                        ),
+                                                  ),
+                                                ),
+                                                fontSize: 24,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    for (final entry in _remoteCursors.entries)
+                                      _buildRemoteCursor(entry.value),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      top: 16,
+                      right: 16,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          FloatingActionButton(
+                            heroTag: 'tools_fab',
+                            backgroundColor: const Color(0xFF7C5CFF),
+                            onPressed: () => setState(
+                              () => _toolsExpanded = !_toolsExpanded,
+                            ),
+                            child: Icon(
+                              _toolsExpanded ? Icons.close : Icons.brush,
+                            ),
+                          ),
+                          if (_toolsExpanded) ...[
+                            const SizedBox(height: 12),
+                            _buildToolGrid(),
+                          ],
+                        ],
                       ),
                     ),
                     Positioned(
                       right: 16,
                       bottom: 16,
-                      child: Column(
+                      child: Row(
                         children: [
                           FloatingActionButton.small(
                             heroTag: 'undo',
                             onPressed: _undoMyLastStroke,
                             child: const Icon(Icons.undo),
                           ),
-                          const SizedBox(height: 8),
+                          const SizedBox(width: 8),
                           FloatingActionButton.small(
                             heroTag: 'redo',
                             onPressed: _redoMyLastStroke,
                             child: const Icon(Icons.redo),
                           ),
-                          const SizedBox(height: 8),
-                          FloatingActionButton.small(
-                            heroTag: 'redo',
-                            onPressed: () => _scribbleNotifier.redo(),
-                            child: const Icon(Icons.redo),
-                          ),
+                          if (widget.isHost) ...[
+                            const SizedBox(width: 8),
+                            FloatingActionButton.small(
+                              heroTag: 'host_undo',
+                              backgroundColor: Colors.deepOrange,
+                              onPressed: _hostUndoLastStroke,
+                              child: const Icon(Icons.admin_panel_settings),
+                            ),
+                          ],
                         ],
                       ),
                     ),
                   ],
                 ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildToolGrid() {
+    final tools = [
+      (ToolType.brush, Icons.brush, 'Brush'),
+      (ToolType.eraser, Icons.auto_fix_normal, 'Eraser'),
+      (ToolType.rectangle, Icons.crop_square, 'Rectangle'),
+      (ToolType.circle, Icons.circle_outlined, 'Circle'),
+      (ToolType.line, Icons.horizontal_rule, 'Line'),
+      (ToolType.text, Icons.text_fields, 'Text'),
+      (ToolType.eyedropper, Icons.colorize, 'Eyedropper'),
+      (ToolType.blur, Icons.blur_on, 'Blur'),
+    ];
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.black87,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final (tool, icon, label) in tools) ...[
+            _buildToolButton(tool, icon, label),
+            const SizedBox(height: 8),
+          ],
+          _buildLayersButton(),
+          const SizedBox(height: 8),
+          _buildZoomButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildToolButton(ToolType tool, IconData icon, String label) {
+    final isSelected = _currentTool == tool;
+    return GestureDetector(
+      onTap: () => _selectTool(tool),
+      child: Container(
+        width: 56,
+        height: 56,
+        decoration: BoxDecoration(
+          color: isSelected ? const Color(0xFF7C5CFF) : Colors.white12,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Icon(icon, color: Colors.white, size: 24),
+      ),
+    );
+  }
+
+  Widget _buildLayersButton() {
+    return GestureDetector(
+      onTap: () {
+        showModalBottomSheet(
+          context: context,
+          backgroundColor: Colors.black87,
+          builder: (context) => const Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'Layers panel coming soon',
+              style: TextStyle(color: Colors.white70),
+            ),
+          ),
+        );
+      },
+      child: Container(
+        width: 56,
+        height: 56,
+        decoration: BoxDecoration(
+          color: Colors.white12,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Icon(Icons.layers, color: Colors.white, size: 24),
+      ),
+    );
+  }
+
+  Widget _buildZoomButton() {
+    return GestureDetector(
+      onTap: () {
+        final isZoomedIn = _zoomController.value.getMaxScaleOnAxis() > 1.5;
+        _zoomController.value = isZoomedIn
+            ? Matrix4.identity()
+            : (Matrix4.identity()..scale(2.0));
+      },
+      child: Container(
+        width: 56,
+        height: 56,
+        decoration: BoxDecoration(
+          color: Colors.white12,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Icon(Icons.zoom_in, color: Colors.white, size: 24),
+      ),
+    );
+  }
+
+  Widget _buildRemoteCursor(Map<String, dynamic> cursor) {
+    final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return const SizedBox.shrink();
+
+    final color = Color(
+      int.parse((cursor['color'] as String).replaceFirst('#', '0xFF')),
+    );
+
+    return Positioned(
+      left: (cursor['x'] as num) * box.size.width - 8,
+      top: (cursor['y'] as num) * box.size.height - 8,
+      child: IgnorePointer(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 16,
+              height: 16,
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(
+                cursor['name'] ?? '?',
+                style: const TextStyle(color: Colors.white, fontSize: 10),
               ),
             ),
           ],
@@ -380,4 +1335,46 @@ class _RoomScreenState extends State<RoomScreen> {
       ),
     );
   }
+}
+
+class _ShapePreviewPainter extends CustomPainter {
+  final ToolType tool;
+  final Offset? start;
+  final Offset? current;
+  final Color color;
+
+  _ShapePreviewPainter({
+    required this.tool,
+    required this.start,
+    required this.current,
+    required this.color,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (start == null || current == null) return;
+
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 4
+      ..style = PaintingStyle.stroke;
+
+    switch (tool) {
+      case ToolType.line:
+        canvas.drawLine(start!, current!, paint);
+        break;
+      case ToolType.rectangle:
+        canvas.drawRect(Rect.fromPoints(start!, current!), paint);
+        break;
+      case ToolType.circle:
+        canvas.drawOval(Rect.fromPoints(start!, current!), paint);
+        break;
+      default:
+        break;
+    }
+  }
+
+  @override
+  bool shouldRepaint(_ShapePreviewPainter oldDelegate) =>
+      oldDelegate.start != start || oldDelegate.current != current;
 }
