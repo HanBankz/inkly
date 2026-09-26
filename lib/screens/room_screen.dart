@@ -6,6 +6,7 @@ import 'package:saver_gallery/saver_gallery.dart';
 import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'dart:async';
+import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 
 enum ToolType { brush, eraser, rectangle, circle, line, text, eyedropper, blur }
 
@@ -64,6 +65,21 @@ class _RoomScreenState extends State<RoomScreen> {
   FocusNode? _pendingTextFocusNode;
   Timer? _textDeleteTimer;
   bool _blockCanvasForText = false;
+
+  final List<String> _colorSwatches = [
+    '#000000',
+    '#FF3B30',
+    '#FF9500',
+    '#FFCC00',
+    '#34C759',
+    '#5AC8FA',
+    '#007AFF',
+    '#AF52DE',
+    '#FF2D55',
+    '#FFFFFF',
+  ];
+  double _brushSize = 4;
+  bool _showOpacitySlider = false;
 
   // --- LIFECYCLE ZONE ---
   @override
@@ -585,6 +601,64 @@ class _RoomScreenState extends State<RoomScreen> {
       );
     } catch (e) {
       debugPrint('Eyedropper failed: $e');
+    }
+  }
+
+  void _applyColor(String hex) {
+    setState(() {
+      _myColorHex = hex;
+      _currentTool = ToolType.brush;
+    });
+    _scribbleNotifier.setColor(
+      Color(
+        int.parse(hex.replaceFirst('#', '0xFF')),
+      ).withValues(alpha: _brushOpacity),
+    );
+  }
+
+  void _applyBrushSize(double size) {
+    setState(() => _brushSize = size);
+    _scribbleNotifier.setStrokeWidth(size);
+  }
+
+  void _applyBrushOpacity(double opacity) {
+    setState(() => _brushOpacity = opacity);
+    _scribbleNotifier.setColor(
+      Color(
+        int.parse(_myColorHex.replaceFirst('#', '0xFF')),
+      ).withValues(alpha: opacity),
+    );
+  }
+
+  Future<void> _openCustomColorPicker() async {
+    Color pickerColor = Color(int.parse(_myColorHex.replaceFirst('#', '0xFF')));
+
+    final result = await showDialog<Color>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Pick a color'),
+        content: SingleChildScrollView(
+          child: ColorPicker(
+            pickerColor: pickerColor,
+            onColorChanged: (color) => pickerColor = color,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(pickerColor),
+            child: const Text('Select'),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      final hex = '#${result.toARGB32().toRadixString(16).substring(2)}';
+      _applyColor(hex);
     }
   }
 
@@ -1126,7 +1200,97 @@ class _RoomScreenState extends State<RoomScreen> {
                   ],
                 ),
               ),
-            ),
+            ), //bottom pallete color
+            Container(
+              color: Colors.black,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    height: 44,
+                    child: ListView(
+                      scrollDirection: Axis.horizontal,
+                      children: [
+                        for (final hex in _colorSwatches)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 10),
+                            child: GestureDetector(
+                              onTap: () => _applyColor(hex),
+                              child: Container(
+                                width: 36,
+                                height: 36,
+                                decoration: BoxDecoration(
+                                  color: Color(
+                                    int.parse(hex.replaceFirst('#', '0xFF')),
+                                  ),
+                                  shape: BoxShape.circle,
+                                  border: _myColorHex == hex
+                                      ? Border.all(
+                                          color: Colors.white,
+                                          width: 2,
+                                        )
+                                      : null,
+                                ),
+                              ),
+                            ),
+                          ),
+                        GestureDetector(
+                          onTap: _openCustomColorPicker,
+                          child: Container(
+                            width: 36,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              color: Colors.white12,
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.add,
+                              color: Colors.white,
+                              size: 18,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      IconButton(
+                        onPressed: () => setState(
+                          () => _showOpacitySlider = !_showOpacitySlider,
+                        ),
+                        icon: Icon(
+                          _showOpacitySlider
+                              ? Icons.opacity
+                              : Icons.line_weight,
+                          color: Colors.white70,
+                          size: 20,
+                        ),
+                      ),
+                      Expanded(
+                        child: _showOpacitySlider
+                            ? Slider(
+                                value: _brushOpacity,
+                                min: 0.1,
+                                max: 1.0,
+                                activeColor: const Color(0xFF7C5CFF),
+                                onChanged: _applyBrushOpacity,
+                              )
+                            : Slider(
+                                value: _brushSize,
+                                min: 1,
+                                max: 30,
+                                activeColor: const Color(0xFF7C5CFF),
+                                onChanged: _applyBrushSize,
+                              ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ), //bottom pallete ending
           ],
         ),
       ),
