@@ -7,6 +7,7 @@ import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'dart:async';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'dart:convert';
 
 enum ToolType { brush, eraser, rectangle, circle, line, text, eyedropper, blur }
 
@@ -20,7 +21,7 @@ class RoomScreen extends StatefulWidget {
   State<RoomScreen> createState() => _RoomScreenState();
 }
 
-class _RoomScreenState extends State<RoomScreen> {
+class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   // --- VARIABLES ZONE ---
   late final ScribbleNotifier _scribbleNotifier;
   late final RealtimeChannel _presenceChannel;
@@ -33,6 +34,7 @@ class _RoomScreenState extends State<RoomScreen> {
   final Uuid _uuid = const Uuid();
   final List<Map<String, dynamic>> _canvasStrokes = [];
   final List<Map<String, dynamic>> _redoStack = [];
+  final List<Map<String, dynamic>> _actionLog = [];
 
   RealtimeChannel? _cursorChannel;
   Map<String, Map<String, dynamic>> _remoteCursors = {};
@@ -66,6 +68,11 @@ class _RoomScreenState extends State<RoomScreen> {
   Timer? _textDeleteTimer;
   bool _blockCanvasForText = false;
 
+  final List<Map<String, dynamic>> _canvasImages = [];
+  RealtimeChannel? _imageChannel;
+  Offset? _blurStart;
+  Offset? _blurCurrent;
+
   final List<String> _colorSwatches = [
     '#000000',
     '#FF3B30',
@@ -84,6 +91,7 @@ class _RoomScreenState extends State<RoomScreen> {
   // --- LIFECYCLE ZONE ---
   @override
   void initState() {
+    WidgetsBinding.instance.addObserver(this);
     super.initState();
     _scribbleNotifier = ScribbleNotifier();
     _scribbleNotifier.setColor(Colors.black);
@@ -95,6 +103,8 @@ class _RoomScreenState extends State<RoomScreen> {
     _setupCursorSync();
     _setupTextSync();
     _loadTextHistory();
+    _setupImageSync();
+    _loadImageHistory();
     _scribbleNotifier.addListener(_onScribbleChanged);
   }
 
@@ -102,13 +112,17 @@ class _RoomScreenState extends State<RoomScreen> {
   void dispose() {
     _scribbleNotifier.removeListener(_onScribbleChanged);
     _scribbleNotifier.dispose();
-    _presenceChannel.unsubscribe();
-    _strokeChannel?.unsubscribe();
-    _cursorChannel?.unsubscribe();
+    final supabase = Supabase.instance.client;
+    supabase.removeChannel(_presenceChannel);
+    if (_strokeChannel != null) supabase.removeChannel(_strokeChannel!);
+    if (_cursorChannel != null) supabase.removeChannel(_cursorChannel!);
+    if (_textChannel != null) supabase.removeChannel(_textChannel!);
+    if (_imageChannel != null) supabase.removeChannel(_imageChannel!);
     _pendingTextController?.dispose();
     _pendingTextFocusNode?.dispose();
     _textDeleteTimer?.cancel();
     super.dispose();
+    WidgetsBinding.instance.removeObserver(this);
   }
 
   // --- LOGIC ZONE ---
@@ -150,6 +164,15 @@ class _RoomScreenState extends State<RoomScreen> {
     });
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadStrokeHistory();
+      _loadTextHistory();
+      _loadImageHistory();
+    }
+  }
+
   Future<void> _loadStrokeHistory() async {
     final supabase = Supabase.instance.client;
 
@@ -169,6 +192,8 @@ class _RoomScreenState extends State<RoomScreen> {
     }
 
     _rebuildCanvas();
+
+    _rebuildActionLog();
   }
 
   void _rebuildCanvas() {
@@ -181,6 +206,20 @@ class _RoomScreenState extends State<RoomScreen> {
     );
     _isApplyingRemoteStroke = false;
     _knownLineCount = lines.length;
+  }
+
+  void _rebuildActionLog() {
+    final combined = <Map<String, dynamic>>[
+      for (final s in _canvasStrokes)
+        {'type': 'stroke', 'id': s['id'], 'user_id': s['user_id']},
+      for (final t in _canvasTexts)
+        {'type': 'text', 'id': t['id'], 'user_id': t['user_id']},
+      for (final i in _canvasImages)
+        {'type': 'image', 'id': i['id'], 'user_id': i['user_id']},
+    ];
+    _actionLog
+      ..clear()
+      ..addAll(combined);
   }
 
   void _setupStrokeSync() {
@@ -196,6 +235,11 @@ class _RoomScreenState extends State<RoomScreen> {
           'user_id': payload['user_id'],
           'line': SketchLine.fromJson(payload['line']),
         });
+        _actionLog.add({
+          'type': 'stroke',
+          'id': payload['id'],
+          'user_id': payload['user_id'],
+        });
         _rebuildCanvas();
       },
     );
@@ -204,6 +248,7 @@ class _RoomScreenState extends State<RoomScreen> {
       event: 'stroke_removed',
       callback: (payload) {
         _canvasStrokes.removeWhere((s) => s['id'] == payload['id']);
+        _actionLog.removeWhere((a) => a['id'] == payload['id']);
         _rebuildCanvas();
       },
     );
@@ -239,6 +284,7 @@ class _RoomScreenState extends State<RoomScreen> {
     final strokeId = _uuid.v4();
 
     _canvasStrokes.add({'id': strokeId, 'user_id': userId, 'line': line});
+    _actionLog.add({'type': 'stroke', 'id': strokeId, 'user_id': userId});
     _redoStack.clear();
     _knownLineCount = _canvasStrokes.length;
 
@@ -260,94 +306,201 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<Map<String, dynamic>?> _removeAction(
+    Map<String, dynamic> entry,
+  ) async {
+    final type = entry['type'];
+    final id = entry['id'];
+
+    if (type == 'stroke') {
+      final index = _canvasStrokes.indexWhere((s) => s['id'] == id);
+      if (index == -1) return null;
+      final removed = _canvasStrokes.removeAt(index);
+      _rebuildCanvas();
+      _strokeChannel?.sendBroadcastMessage(
+        event: 'stroke_removed',
+        payload: {'id': id},
+      );
+      try {
+        await Supabase.instance.client.from('strokes').delete().eq('id', id);
+      } catch (e) {
+        debugPrint('Undo (stroke) failed: $e');
+      }
+      return {'type': 'stroke', 'data': removed};
+    }
+
+    if (type == 'text') {
+      final index = _canvasTexts.indexWhere((t) => t['id'] == id);
+      if (index == -1) return null;
+      final removed = _canvasTexts.removeAt(index);
+      setState(() {});
+      _textChannel?.sendBroadcastMessage(
+        event: 'text_removed',
+        payload: {'id': id},
+      );
+      try {
+        await Supabase.instance.client
+            .from('canvas_texts')
+            .delete()
+            .eq('id', id);
+      } catch (e) {
+        debugPrint('Undo (text) failed: $e');
+      }
+      return {'type': 'text', 'data': removed};
+    }
+
+    if (type == 'image') {
+      final index = _canvasImages.indexWhere((img) => img['id'] == id);
+      if (index == -1) return null;
+      final removed = _canvasImages.removeAt(index);
+      setState(() {});
+      _imageChannel?.sendBroadcastMessage(
+        event: 'image_removed',
+        payload: {'id': id},
+      );
+      try {
+        await Supabase.instance.client
+            .from('canvas_images')
+            .delete()
+            .eq('id', id);
+      } catch (e) {
+        debugPrint('Undo (image) failed: $e');
+      }
+      return {'type': 'image', 'data': removed};
+    }
+
+    return null;
+  }
+
+  Future<void> _restoreAction(Map<String, dynamic> redoEntry) async {
+    final type = redoEntry['type'];
+    final data = redoEntry['data'];
+
+    if (type == 'stroke') {
+      _canvasStrokes.add(data);
+      _actionLog.add({
+        'type': 'stroke',
+        'id': data['id'],
+        'user_id': data['user_id'],
+      });
+      _rebuildCanvas();
+      final line = data['line'] as SketchLine;
+      _strokeChannel?.sendBroadcastMessage(
+        event: 'stroke_added',
+        payload: {
+          'id': data['id'],
+          'user_id': data['user_id'],
+          'line': line.toJson(),
+        },
+      );
+      try {
+        await Supabase.instance.client.from('strokes').insert({
+          'id': data['id'],
+          'room_code': widget.roomCode,
+          'user_id': data['user_id'],
+          'stroke_data': line.toJson(),
+        });
+      } catch (e) {
+        debugPrint('Redo (stroke) failed: $e');
+      }
+    } else if (type == 'text') {
+      setState(() {
+        _canvasTexts.add(data);
+        _actionLog.add({
+          'type': 'text',
+          'id': data['id'],
+          'user_id': data['user_id'],
+        });
+      });
+      _textChannel?.sendBroadcastMessage(event: 'text_added', payload: data);
+      try {
+        await Supabase.instance.client.from('canvas_texts').insert({
+          'id': data['id'],
+          'room_code': widget.roomCode,
+          'user_id': data['user_id'],
+          'content': data['content'],
+          'pos_x': data['pos_x'],
+          'pos_y': data['pos_y'],
+          'color': data['color'],
+          'font_size': data['font_size'],
+        });
+      } catch (e) {
+        debugPrint('Redo (text) failed: $e');
+      }
+    } else if (type == 'image') {
+      setState(() {
+        _canvasImages.add(data);
+        _actionLog.add({
+          'type': 'image',
+          'id': data['id'],
+          'user_id': data['user_id'],
+        });
+      });
+      _imageChannel?.sendBroadcastMessage(event: 'image_added', payload: data);
+      try {
+        await Supabase.instance.client.from('canvas_images').insert({
+          'id': data['id'],
+          'room_code': widget.roomCode,
+          'user_id': data['user_id'],
+          'image_data': data['image_data'],
+          'pos_x': data['pos_x'],
+          'pos_y': data['pos_y'],
+          'width': data['width'],
+          'height': data['height'],
+        });
+      } catch (e) {
+        debugPrint('Redo (image) failed: $e');
+      }
+    }
+  }
+
   Future<void> _undoMyLastStroke() async {
     final userId = Supabase.instance.client.auth.currentUser!.id;
-
-    final index = _canvasStrokes.lastIndexWhere((s) => s['user_id'] == userId);
+    final index = _actionLog.lastIndexWhere((a) => a['user_id'] == userId);
     if (index == -1) return;
 
-    final removed = _canvasStrokes.removeAt(index);
-    _redoStack.add(removed);
-    _rebuildCanvas();
+    final entry = _actionLog.removeAt(index);
+    final removed = await _removeAction(entry);
+    if (removed != null) _redoStack.add(removed);
+  }
 
-    _strokeChannel?.sendBroadcastMessage(
-      event: 'stroke_removed',
-      payload: {'id': removed['id']},
-    );
+  Future<void> _hostUndoLastStroke() async {
+    if (_actionLog.isEmpty) return;
 
-    try {
-      // CHANGED: added await + try/catch so a failed delete is never silent
-      await Supabase.instance.client
-          .from('strokes')
-          .delete()
-          .eq('id', removed['id']);
-    } catch (e) {
-      debugPrint('Failed to delete stroke: $e');
-    }
+    final entry = _actionLog.removeLast();
+    await _removeAction(entry);
   }
 
   Future<void> _redoMyLastStroke() async {
     if (_redoStack.isEmpty) return;
-
-    final restored = _redoStack.removeLast();
-    _canvasStrokes.add(restored);
-    _rebuildCanvas();
-
-    final line = restored['line'] as SketchLine;
-
-    _strokeChannel?.sendBroadcastMessage(
-      event: 'stroke_added',
-      payload: {
-        'id': restored['id'],
-        'user_id': restored['user_id'],
-        'line': line.toJson(),
-      },
-    );
-
-    try {
-      // CHANGED: added await + try/catch so a failed insert is never silent
-      await Supabase.instance.client.from('strokes').insert({
-        'id': restored['id'],
-        'room_code': widget.roomCode,
-        'user_id': restored['user_id'],
-        'stroke_data': line.toJson(),
-      });
-    } catch (e) {
-      debugPrint('Failed to restore stroke: $e');
-    }
+    final redoEntry = _redoStack.removeLast();
+    await _restoreAction(redoEntry);
   }
 
-  Future<void> _hostUndoLastStroke() async {
-    if (_canvasStrokes.isEmpty) return;
-
-    final removed = _canvasStrokes.removeLast();
+  Future<void> _clearCanvas() async {
+    _canvasStrokes.clear();
+    _canvasTexts.clear();
+    _canvasImages.clear();
+    _actionLog.clear();
+    _redoStack.clear();
     _rebuildCanvas();
+    setState(() {});
 
-    _strokeChannel?.sendBroadcastMessage(
-      event: 'stroke_removed',
-      payload: {'id': removed['id']},
-    );
+    _strokeChannel?.sendBroadcastMessage(event: 'canvas_cleared', payload: {});
+    _textChannel?.sendBroadcastMessage(event: 'canvas_cleared', payload: {});
+    _imageChannel?.sendBroadcastMessage(event: 'canvas_cleared', payload: {});
 
     try {
       await Supabase.instance.client
           .from('strokes')
           .delete()
-          .eq('id', removed['id']);
-    } catch (e) {
-      debugPrint('Host undo failed: $e');
-    }
-  }
-
-  Future<void> _clearCanvas() async {
-    _canvasStrokes.clear();
-    _redoStack.clear();
-    _rebuildCanvas();
-
-    _strokeChannel?.sendBroadcastMessage(event: 'canvas_cleared', payload: {});
-
-    try {
+          .eq('room_code', widget.roomCode);
       await Supabase.instance.client
-          .from('strokes')
+          .from('canvas_texts')
+          .delete()
+          .eq('room_code', widget.roomCode);
+      await Supabase.instance.client
+          .from('canvas_images')
           .delete()
           .eq('room_code', widget.roomCode);
     } catch (e) {
@@ -459,7 +612,6 @@ class _RoomScreenState extends State<RoomScreen> {
       case ToolType.eyedropper:
         break;
       case ToolType.blur:
-        // Blur logic — next category
         break;
     }
   }
@@ -604,6 +756,59 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _applyBlurToRegion(Offset start, Offset end) async {
+    try {
+      final rect = Rect.fromPoints(start, end);
+      if (rect.width < 10 || rect.height < 10) return;
+
+      final rawBytes = await _scribbleNotifier.renderImage(pixelRatio: 1.0);
+      final codec = await ui.instantiateImageCodec(
+        rawBytes.buffer.asUint8List(),
+      );
+      final frame = await codec.getNextFrame();
+      final fullImage = frame.image;
+
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+
+      canvas.saveLayer(
+        Rect.fromLTWH(0, 0, rect.width, rect.height),
+        Paint()
+          ..imageFilter = ui.ImageFilter.blur(
+            sigmaX: 13,
+            sigmaY: 13,
+          ), //heavier blur
+      );
+      canvas.drawImageRect(
+        fullImage,
+        rect,
+        Rect.fromLTWH(0, 0, rect.width, rect.height),
+        Paint(),
+      );
+      canvas.restore();
+
+      final picture = recorder.endRecording();
+      final blurredImage = await picture.toImage(
+        rect.width.round(),
+        rect.height.round(),
+      );
+      final blurredBytes = await blurredImage.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      final base64Data = base64Encode(blurredBytes!.buffer.asUint8List());
+
+      await _addCanvasImage(
+        base64Data,
+        rect.left,
+        rect.top,
+        rect.width,
+        rect.height,
+      );
+    } catch (e) {
+      debugPrint('Blur failed: $e');
+    }
+  }
+
   void _applyColor(String hex) {
     setState(() {
       _myColorHex = hex;
@@ -668,7 +873,14 @@ class _RoomScreenState extends State<RoomScreen> {
     _textChannel!.onBroadcast(
       event: 'text_added',
       callback: (payload) {
-        setState(() => _canvasTexts.add(payload));
+        setState(() {
+          _canvasTexts.add(payload);
+          _actionLog.add({
+            'type': 'text',
+            'id': payload['id'],
+            'user_id': payload['user_id'],
+          });
+        });
       },
     );
 
@@ -695,6 +907,31 @@ class _RoomScreenState extends State<RoomScreen> {
       callback: (payload) {
         setState(() {
           _canvasTexts.removeWhere((t) => t['id'] == payload['id']);
+          _actionLog.removeWhere((a) => a['id'] == payload['id']);
+        });
+      },
+    );
+
+    _textChannel!.onBroadcast(
+      event: 'canvas_cleared',
+      callback: (payload) {
+        setState(() => _canvasTexts.clear());
+      },
+    );
+
+    _textChannel!.onBroadcast(
+      event: 'text_resized',
+      callback: (payload) {
+        setState(() {
+          final index = _canvasTexts.indexWhere(
+            (t) => t['id'] == payload['id'],
+          );
+          if (index != -1) {
+            _canvasTexts[index] = {
+              ..._canvasTexts[index],
+              'font_size': payload['font_size'],
+            };
+          }
         });
       },
     );
@@ -710,8 +947,18 @@ class _RoomScreenState extends State<RoomScreen> {
 
     setState(() {
       _canvasTexts.clear();
-      _canvasTexts.addAll(rows.map((r) => Map<String, dynamic>.from(r)));
+      _canvasTexts.addAll(
+        rows.map(
+          (r) => {
+            ...Map<String, dynamic>.from(r),
+            'pos_x': (r['pos_x'] as num).toDouble(),
+            'pos_y': (r['pos_y'] as num).toDouble(),
+            'font_size': (r['font_size'] as num).toDouble(),
+          },
+        ),
+      );
     });
+    _rebuildActionLog();
   }
 
   void _startTextEntry(Offset position) {
@@ -756,16 +1003,27 @@ class _RoomScreenState extends State<RoomScreen> {
       'pos_x': position.dx,
       'pos_y': position.dy,
       'color': _myColorHex,
+      'font_size': 32.0,
     };
 
-    setState(() => _canvasTexts.add(data));
+    setState(() {
+      _canvasTexts.add(data);
+      _actionLog.add({'type': 'text', 'id': id, 'user_id': userId});
+      _redoStack.clear();
+    });
 
     _textChannel?.sendBroadcastMessage(event: 'text_added', payload: data);
 
     try {
       await Supabase.instance.client.from('canvas_texts').insert({
-        ...data,
+        'id': data['id'],
         'room_code': widget.roomCode,
+        'user_id': data['user_id'],
+        'content': data['content'],
+        'pos_x': data['pos_x'],
+        'pos_y': data['pos_y'],
+        'color': data['color'],
+        'font_size': data['font_size'],
       });
     } catch (e) {
       debugPrint('Failed to save text: $e');
@@ -799,6 +1057,29 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _updateTextFontSize(String id, double fontSize) async {
+    setState(() {
+      final index = _canvasTexts.indexWhere((t) => t['id'] == id);
+      if (index != -1) {
+        _canvasTexts[index] = {..._canvasTexts[index], 'font_size': fontSize};
+      }
+    });
+
+    _textChannel?.sendBroadcastMessage(
+      event: 'text_resized',
+      payload: {'id': id, 'font_size': fontSize},
+    );
+
+    try {
+      await Supabase.instance.client
+          .from('canvas_texts')
+          .update({'font_size': fontSize})
+          .eq('id', id);
+    } catch (e) {
+      debugPrint('Failed to resize text: $e');
+    }
+  }
+
   Future<void> _deleteText(Map<String, dynamic> text) async {
     final userId = Supabase.instance.client.auth.currentUser!.id;
     final isOwner = text['user_id'] == userId;
@@ -829,10 +1110,240 @@ class _RoomScreenState extends State<RoomScreen> {
     final isOwner = text['user_id'] == userId;
     if (!isOwner && !widget.isHost) return;
 
+    double currentSize = (text['font_size'] ?? 32).toDouble();
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => Dialog(
+          backgroundColor: Colors.black87,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  text['content'],
+                  style: TextStyle(
+                    color: Color(
+                      int.parse(
+                        (text['color'] as String).replaceFirst('#', '0xFF'),
+                      ),
+                    ),
+                    fontSize: currentSize.clamp(16, 40),
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.text_fields,
+                      color: Colors.white54,
+                      size: 18,
+                    ),
+                    Expanded(
+                      child: Slider(
+                        value: currentSize,
+                        min: 12,
+                        max: 72,
+                        activeColor: const Color(0xFF7C5CFF),
+                        onChanged: (value) {
+                          setDialogState(() => currentSize = value);
+                          _updateTextFontSize(text['id'], value);
+                        },
+                      ),
+                    ),
+                    const Icon(
+                      Icons.text_fields,
+                      color: Colors.white,
+                      size: 26,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                      _deleteText(text);
+                    },
+                    icon: const Icon(Icons.delete, color: Colors.redAccent),
+                    label: const Text(
+                      'Delete',
+                      style: TextStyle(color: Colors.redAccent),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: Colors.redAccent),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text(
+                      'Done',
+                      style: TextStyle(color: Colors.white70),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _setupImageSync() {
+    _imageChannel = Supabase.instance.client.channel(
+      'images:${widget.roomCode}',
+    );
+
+    _imageChannel!.onBroadcast(
+      event: 'image_added',
+      callback: (payload) {
+        setState(() {
+          _canvasImages.add(payload);
+          _actionLog.add({
+            'type': 'image',
+            'id': payload['id'],
+            'user_id': payload['user_id'],
+          });
+        });
+      },
+    );
+
+    _imageChannel!.onBroadcast(
+      event: 'image_removed',
+      callback: (payload) {
+        setState(() {
+          _canvasImages.removeWhere((img) => img['id'] == payload['id']);
+          _actionLog.removeWhere((a) => a['id'] == payload['id']);
+        });
+      },
+    );
+
+    _imageChannel!.onBroadcast(
+      event: 'canvas_cleared',
+      callback: (payload) {
+        setState(() => _canvasImages.clear());
+      },
+    );
+
+    _imageChannel!.subscribe();
+  }
+
+  Future<void> _loadImageHistory() async {
+    final rows = await Supabase.instance.client
+        .from('canvas_images')
+        .select()
+        .eq('room_code', widget.roomCode);
+
+    setState(() {
+      _canvasImages.clear();
+      _canvasImages.addAll(
+        rows.map(
+          (r) => {
+            ...Map<String, dynamic>.from(r),
+            'pos_x': (r['pos_x'] as num).toDouble(),
+            'pos_y': (r['pos_y'] as num).toDouble(),
+            'width': (r['width'] as num).toDouble(),
+            'height': (r['height'] as num).toDouble(),
+          },
+        ),
+      );
+    });
+    _rebuildActionLog();
+  }
+
+  Future<void> _addCanvasImage(
+    String base64Data,
+    double x,
+    double y,
+    double width,
+    double height,
+  ) async {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    final id = _uuid.v4();
+    final data = {
+      'id': id,
+      'user_id': userId,
+      'image_data': base64Data,
+      'pos_x': x,
+      'pos_y': y,
+      'width': width,
+      'height': height,
+    };
+
+    setState(() {
+      _canvasImages.add(data);
+      _actionLog.add({'type': 'image', 'id': id, 'user_id': userId});
+      _redoStack.clear();
+    });
+
+    _imageChannel?.sendBroadcastMessage(event: 'image_added', payload: data);
+
+    try {
+      await Supabase.instance.client.from('canvas_images').insert({
+        'id': data['id'],
+        'room_code': widget.roomCode,
+        'user_id': data['user_id'],
+        'image_data': data['image_data'],
+        'pos_x': data['pos_x'],
+        'pos_y': data['pos_y'],
+        'width': data['width'],
+        'height': data['height'],
+      });
+    } catch (e) {
+      debugPrint('Failed to save image: $e');
+    }
+  }
+
+  Future<void> _deleteCanvasImage(Map<String, dynamic> image) async {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    final isOwner = image['user_id'] == userId;
+    if (!isOwner && !widget.isHost) return;
+
+    setState(
+      () => _canvasImages.removeWhere((img) => img['id'] == image['id']),
+    );
+
+    _imageChannel?.sendBroadcastMessage(
+      event: 'image_removed',
+      payload: {'id': image['id']},
+    );
+
+    try {
+      await Supabase.instance.client
+          .from('canvas_images')
+          .delete()
+          .eq('id', image['id']);
+    } catch (e) {
+      debugPrint('Failed to delete image: $e');
+    }
+  }
+
+  void _confirmDeleteImage(Map<String, dynamic> image) {
+    final userId = Supabase.instance.client.auth.currentUser!.id;
+    final isOwner = image['user_id'] == userId;
+    if (!isOwner && !widget.isHost) return;
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Delete this text?'),
+        title: const Text('Delete this image?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
@@ -841,7 +1352,7 @@ class _RoomScreenState extends State<RoomScreen> {
           TextButton(
             onPressed: () {
               Navigator.of(context).pop();
-              _deleteText(text);
+              _deleteCanvasImage(image);
             },
             child: const Text('Delete', style: TextStyle(color: Colors.red)),
           ),
@@ -877,6 +1388,8 @@ class _RoomScreenState extends State<RoomScreen> {
   }
 
   void _handlePointerMove(PointerEvent event) {
+    if (_currentTool != ToolType.brush && _currentTool != ToolType.eraser)
+      return;
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastCursorSentAt < 50) return;
     _lastCursorSentAt = now;
@@ -962,184 +1475,233 @@ class _RoomScreenState extends State<RoomScreen> {
                         transformationController: _zoomController,
                         minScale: 1.0,
                         maxScale: 4.0,
+                        boundaryMargin: const EdgeInsets.all(double.infinity),
                         child: Center(
-                          child: FittedBox(
-                            fit: BoxFit.contain,
-                            child: SizedBox(
-                              width: 1080,
-                              height: 2300,
-                              child: Listener(
-                                onPointerMove: _handlePointerMove,
-                                onPointerUp: _handlePointerUp,
-                                child: Stack(
-                                  key: _canvasKey,
-                                  children: [
+                          child: SizedBox(
+                            width: 1080,
+                            height: 2300,
+                            child: Listener(
+                              onPointerMove: _handlePointerMove,
+                              onPointerUp: _handlePointerUp,
+                              child: Stack(
+                                key: _canvasKey,
+                                children: [
+                                  Positioned.fill(
+                                    child: IgnorePointer(
+                                      ignoring:
+                                          _isShapeTool ||
+                                          _currentTool == ToolType.text ||
+                                          _currentTool == ToolType.eyedropper ||
+                                          _currentTool == ToolType.blur ||
+                                          _blockCanvasForText,
+                                      child: Scribble(
+                                        notifier: _scribbleNotifier,
+                                        drawPen: true,
+                                      ),
+                                    ),
+                                  ),
+                                  if (_isShapeTool)
                                     Positioned.fill(
-                                      child: IgnorePointer(
-                                        ignoring:
-                                            _isShapeTool ||
-                                            _currentTool == ToolType.text ||
-                                            _currentTool ==
-                                                ToolType.eyedropper ||
-                                            _blockCanvasForText,
-                                        child: Scribble(
-                                          notifier: _scribbleNotifier,
-                                          drawPen: true,
+                                      child: GestureDetector(
+                                        onPanStart: (details) =>
+                                            _startShape(details.localPosition),
+                                        onPanUpdate: (details) =>
+                                            _updateShape(details.localPosition),
+                                        onPanEnd: (_) => _finishShape(),
+                                        child: CustomPaint(
+                                          painter: _ShapePreviewPainter(
+                                            tool: _currentTool,
+                                            start: _shapeStart,
+                                            current: _shapeCurrent,
+                                            color: Color(
+                                              int.parse(
+                                                _myColorHex.replaceFirst(
+                                                  '#',
+                                                  '0xFF',
+                                                ),
+                                              ),
+                                            ),
+                                          ),
                                         ),
                                       ),
                                     ),
-                                    if (_isShapeTool)
-                                      Positioned.fill(
-                                        child: GestureDetector(
-                                          onPanStart: (details) => _startShape(
-                                            details.localPosition,
-                                          ),
-                                          onPanUpdate: (details) =>
-                                              _updateShape(
-                                                details.localPosition,
-                                              ),
-                                          onPanEnd: (_) => _finishShape(),
-                                          child: CustomPaint(
-                                            painter: _ShapePreviewPainter(
-                                              tool: _currentTool,
-                                              start: _shapeStart,
-                                              current: _shapeCurrent,
-                                              color: Color(
-                                                int.parse(
-                                                  _myColorHex.replaceFirst(
-                                                    '#',
-                                                    '0xFF',
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    if (_currentTool == ToolType.text)
-                                      Positioned.fill(
-                                        child: GestureDetector(
-                                          onTapUp: (details) => _handleTextTap(
-                                            details.localPosition,
-                                          ),
-                                        ),
-                                      ),
-                                    if (_currentTool == ToolType.eyedropper)
-                                      Positioned.fill(
-                                        child: GestureDetector(
-                                          onTapUp: (details) => _pickColorAt(
-                                            details.localPosition,
-                                          ),
-                                        ),
-                                      ),
-                                    if (_pendingTextPosition != null)
-                                      Positioned(
-                                        left: _pendingTextPosition!.dx,
-                                        top: _pendingTextPosition!.dy,
-                                        child: IntrinsicWidth(
-                                          child: TextField(
-                                            controller: _pendingTextController,
-                                            focusNode: _pendingTextFocusNode,
-                                            autofocus: true,
-                                            style: TextStyle(
-                                              color: Color(
-                                                int.parse(
-                                                  _myColorHex.replaceFirst(
-                                                    '#',
-                                                    '0xFF',
-                                                  ),
-                                                ),
-                                              ),
-                                              fontSize: 24,
-                                              fontWeight: FontWeight.bold,
-                                            ),
-                                            decoration: const InputDecoration(
-                                              border: InputBorder.none,
-                                              isDense: true,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    for (final text in _canvasTexts)
-                                      Positioned(
-                                        left: text['pos_x'],
-                                        top: text['pos_y'],
-                                        child: Listener(
-                                          behavior: HitTestBehavior.opaque,
-                                          onPointerDown: (event) {
-                                            setState(
-                                              () => _blockCanvasForText = true,
+                                  if (_currentTool == ToolType.blur)
+                                    Positioned.fill(
+                                      child: GestureDetector(
+                                        onPanStart: (details) => setState(() {
+                                          _blurStart = details.localPosition;
+                                          _blurCurrent = details.localPosition;
+                                        }),
+                                        onPanUpdate: (details) => setState(() {
+                                          _blurCurrent = details.localPosition;
+                                        }),
+                                        onPanEnd: (_) {
+                                          if (_blurStart != null &&
+                                              _blurCurrent != null) {
+                                            _applyBlurToRegion(
+                                              _blurStart!,
+                                              _blurCurrent!,
                                             );
-                                            _draggingTextId = text['id'];
-                                            _dragOriginalPosition = Offset(
+                                          }
+                                          setState(() {
+                                            _blurStart = null;
+                                            _blurCurrent = null;
+                                          });
+                                        },
+                                        child: CustomPaint(
+                                          painter: _ShapePreviewPainter(
+                                            tool: ToolType.rectangle,
+                                            start: _blurStart,
+                                            current: _blurCurrent,
+                                            color: Colors.white54,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  if (_currentTool == ToolType.text)
+                                    Positioned.fill(
+                                      child: GestureDetector(
+                                        onTapUp: (details) => _handleTextTap(
+                                          details.localPosition,
+                                        ),
+                                      ),
+                                    ),
+                                  if (_currentTool == ToolType.eyedropper)
+                                    Positioned.fill(
+                                      child: GestureDetector(
+                                        onTapUp: (details) =>
+                                            _pickColorAt(details.localPosition),
+                                      ),
+                                    ),
+                                  if (_pendingTextPosition != null)
+                                    Positioned(
+                                      left: _pendingTextPosition!.dx,
+                                      top: _pendingTextPosition!.dy,
+                                      child: IntrinsicWidth(
+                                        child: TextField(
+                                          controller: _pendingTextController,
+                                          focusNode: _pendingTextFocusNode,
+                                          autofocus: true,
+                                          style: TextStyle(
+                                            color: Color(
+                                              int.parse(
+                                                _myColorHex.replaceFirst(
+                                                  '#',
+                                                  '0xFF',
+                                                ),
+                                              ),
+                                            ),
+                                            fontSize: 32,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                          decoration: const InputDecoration(
+                                            border: InputBorder.none,
+                                            isDense: true,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  for (final text in _canvasTexts)
+                                    Positioned(
+                                      left: text['pos_x'],
+                                      top: text['pos_y'],
+                                      child: Listener(
+                                        behavior: HitTestBehavior.opaque,
+                                        onPointerDown: (event) {
+                                          setState(
+                                            () => _blockCanvasForText = true,
+                                          );
+                                          _draggingTextId = text['id'];
+                                          _dragOriginalPosition = Offset(
+                                            text['pos_x'],
+                                            text['pos_y'],
+                                          );
+                                          _textDidMove = false;
+                                          _textDeleteTimer?.cancel();
+                                          _textDeleteTimer = Timer(
+                                            const Duration(milliseconds: 500),
+                                            () {
+                                              if (_draggingTextId ==
+                                                      text['id'] &&
+                                                  !_textDidMove) {
+                                                _confirmDeleteText(text);
+                                              }
+                                            },
+                                          );
+                                        },
+                                        onPointerMove: (event) {
+                                          if (_draggingTextId != text['id'])
+                                            return;
+                                          if (!_textDidMove &&
+                                              event.delta.distance > 2) {
+                                            _textDidMove = true;
+                                            _textDeleteTimer?.cancel();
+                                          }
+                                          if (_textDidMove) {
+                                            final current = Offset(
                                               text['pos_x'],
                                               text['pos_y'],
                                             );
-                                            _textDidMove = false;
-                                            _textDeleteTimer?.cancel();
-                                            _textDeleteTimer = Timer(
-                                              const Duration(milliseconds: 500),
-                                              () {
-                                                if (_draggingTextId ==
-                                                        text['id'] &&
-                                                    !_textDidMove) {
-                                                  _confirmDeleteText(text);
-                                                }
-                                              },
+                                            _moveText(
+                                              text['id'],
+                                              current + event.delta,
                                             );
-                                          },
-                                          onPointerMove: (event) {
-                                            if (_draggingTextId != text['id']) {
-                                              return;
-                                            }
-                                            if (!_textDidMove &&
-                                                event.delta.distance > 2) {
-                                              _textDidMove = true;
-                                              _textDeleteTimer?.cancel();
-                                            }
-                                            if (_textDidMove) {
-                                              final current = Offset(
-                                                text['pos_x'],
-                                                text['pos_y'],
-                                              );
-                                              _moveText(
-                                                text['id'],
-                                                current + event.delta,
-                                              );
-                                            }
-                                          },
-                                          onPointerUp: (event) {
-                                            _textDeleteTimer?.cancel();
-                                            _draggingTextId = null;
-                                            setState(
-                                              () => _blockCanvasForText = false,
-                                            );
-                                          },
-                                          child: Container(
-                                            padding: const EdgeInsets.all(12),
-                                            child: Text(
-                                              text['content'],
-                                              style: TextStyle(
-                                                color: Color(
-                                                  int.parse(
-                                                    (text['color'] as String)
-                                                        .replaceFirst(
-                                                          '#',
-                                                          '0xFF',
-                                                        ),
-                                                  ),
+                                          }
+                                        },
+                                        onPointerUp: (event) {
+                                          _textDeleteTimer?.cancel();
+                                          _draggingTextId = null;
+                                          setState(
+                                            () => _blockCanvasForText = false,
+                                          );
+                                        },
+                                        onPointerCancel: (event) {
+                                          _textDeleteTimer?.cancel();
+                                          _draggingTextId = null;
+                                          setState(
+                                            () => _blockCanvasForText = false,
+                                          );
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.all(12),
+                                          child: Text(
+                                            text['content'],
+                                            style: TextStyle(
+                                              color: Color(
+                                                int.parse(
+                                                  (text['color'] as String)
+                                                      .replaceFirst(
+                                                        '#',
+                                                        '0xFF',
+                                                      ),
                                                 ),
-                                                fontSize: 24,
-                                                fontWeight: FontWeight.bold,
                                               ),
+                                              fontSize:
+                                                  (text['font_size'] ?? 32)
+                                                      .toDouble(),
+                                              fontWeight: FontWeight.bold,
                                             ),
                                           ),
                                         ),
                                       ),
-                                    for (final entry in _remoteCursors.entries)
-                                      _buildRemoteCursor(entry.value),
-                                  ],
-                                ),
+                                    ),
+                                  for (final img in _canvasImages)
+                                    Positioned(
+                                      left: img['pos_x'],
+                                      top: img['pos_y'],
+                                      child: GestureDetector(
+                                        onLongPress: () =>
+                                            _confirmDeleteImage(img),
+                                        child: Image.memory(
+                                          base64Decode(img['image_data']),
+                                          width: img['width'],
+                                          height: img['height'],
+                                        ),
+                                      ),
+                                    ),
+                                  for (final entry in _remoteCursors.entries)
+                                    _buildRemoteCursor(entry.value),
+                                ],
                               ),
                             ),
                           ),
@@ -1200,97 +1762,101 @@ class _RoomScreenState extends State<RoomScreen> {
                   ],
                 ),
               ),
-            ), //bottom pallete color
-            Container(
-              color: Colors.black,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SizedBox(
-                    height: 44,
-                    child: ListView(
-                      scrollDirection: Axis.horizontal,
-                      children: [
-                        for (final hex in _colorSwatches)
-                          Padding(
-                            padding: const EdgeInsets.only(right: 10),
-                            child: GestureDetector(
-                              onTap: () => _applyColor(hex),
-                              child: Container(
-                                width: 36,
-                                height: 36,
-                                decoration: BoxDecoration(
-                                  color: Color(
-                                    int.parse(hex.replaceFirst('#', '0xFF')),
+            ),
+            if (_pendingTextPosition == null)
+              Container(
+                color: Colors.black,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 12,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      height: 44,
+                      child: ListView(
+                        scrollDirection: Axis.horizontal,
+                        children: [
+                          for (final hex in _colorSwatches)
+                            Padding(
+                              padding: const EdgeInsets.only(right: 10),
+                              child: GestureDetector(
+                                onTap: () => _applyColor(hex),
+                                child: Container(
+                                  width: 36,
+                                  height: 36,
+                                  decoration: BoxDecoration(
+                                    color: Color(
+                                      int.parse(hex.replaceFirst('#', '0xFF')),
+                                    ),
+                                    shape: BoxShape.circle,
+                                    border: _myColorHex == hex
+                                        ? Border.all(
+                                            color: Colors.white,
+                                            width: 2,
+                                          )
+                                        : null,
                                   ),
-                                  shape: BoxShape.circle,
-                                  border: _myColorHex == hex
-                                      ? Border.all(
-                                          color: Colors.white,
-                                          width: 2,
-                                        )
-                                      : null,
                                 ),
                               ),
                             ),
-                          ),
-                        GestureDetector(
-                          onTap: _openCustomColorPicker,
-                          child: Container(
-                            width: 36,
-                            height: 36,
-                            decoration: BoxDecoration(
-                              color: Colors.white12,
-                              shape: BoxShape.circle,
+                          GestureDetector(
+                            onTap: _openCustomColorPicker,
+                            child: Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                color: Colors.white12,
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.add,
+                                color: Colors.white,
+                                size: 18,
+                              ),
                             ),
-                            child: const Icon(
-                              Icons.add,
-                              color: Colors.white,
-                              size: 18,
-                            ),
                           ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        IconButton(
+                          onPressed: () => setState(
+                            () => _showOpacitySlider = !_showOpacitySlider,
+                          ),
+                          icon: Icon(
+                            _showOpacitySlider
+                                ? Icons.opacity
+                                : Icons.line_weight,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                        ),
+                        Expanded(
+                          child: _showOpacitySlider
+                              ? Slider(
+                                  value: _brushOpacity,
+                                  min: 0.1,
+                                  max: 1.0,
+                                  activeColor: const Color(0xFF7C5CFF),
+                                  onChanged: _applyBrushOpacity,
+                                )
+                              : Slider(
+                                  value: _brushSize,
+                                  min: 1,
+                                  max: 30,
+                                  activeColor: const Color(0xFF7C5CFF),
+                                  onChanged: _applyBrushSize,
+                                ),
                         ),
                       ],
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      IconButton(
-                        onPressed: () => setState(
-                          () => _showOpacitySlider = !_showOpacitySlider,
-                        ),
-                        icon: Icon(
-                          _showOpacitySlider
-                              ? Icons.opacity
-                              : Icons.line_weight,
-                          color: Colors.white70,
-                          size: 20,
-                        ),
-                      ),
-                      Expanded(
-                        child: _showOpacitySlider
-                            ? Slider(
-                                value: _brushOpacity,
-                                min: 0.1,
-                                max: 1.0,
-                                activeColor: const Color(0xFF7C5CFF),
-                                onChanged: _applyBrushOpacity,
-                              )
-                            : Slider(
-                                value: _brushSize,
-                                min: 1,
-                                max: 30,
-                                activeColor: const Color(0xFF7C5CFF),
-                                onChanged: _applyBrushSize,
-                              ),
-                      ),
-                    ],
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ), //bottom pallete ending
           ],
         ),
       ),

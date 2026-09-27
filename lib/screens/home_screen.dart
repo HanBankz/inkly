@@ -88,7 +88,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final room = await supabase
           .from('rooms')
-          .select('code')
+          .select('code, host_id')
           .eq('code', code)
           .maybeSingle();
 
@@ -116,9 +116,13 @@ class _HomeScreenState extends State<HomeScreen> {
       }, onConflict: 'room_code,user_id');
 
       if (!mounted) return;
+
+      final isActuallyHost = room['host_id'] == userId;
+
       Navigator.of(context).push(
         MaterialPageRoute(
-          builder: (context) => RoomScreen(roomCode: code, isHost: false),
+          builder: (context) =>
+              RoomScreen(roomCode: code, isHost: isActuallyHost),
         ),
       );
     } catch (e) {
