@@ -8,6 +8,8 @@ import 'dart:math' as math;
 import 'dart:async';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'dart:convert';
+import 'package:image_picker/image_picker.dart';
+import 'dart:typed_data';
 
 enum ToolType { brush, eraser, rectangle, circle, line, text, eyedropper, blur }
 
@@ -87,6 +89,9 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   ];
   double _brushSize = 4;
   bool _showOpacitySlider = false;
+  bool _hasAutoFitted = false;
+
+  final Map<String, Uint8List> _imageBytesCache = {};
 
   // --- LIFECYCLE ZONE ---
   @override
@@ -206,6 +211,24 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     );
     _isApplyingRemoteStroke = false;
     _knownLineCount = lines.length;
+  }
+
+  void _autoFitCanvas() {
+    if (_hasAutoFitted || !mounted) return;
+    _hasAutoFitted = true;
+
+    final screenSize = MediaQuery.of(context).size;
+    final availableWidth = screenSize.width;
+    final availableHeight = screenSize.height - 220;
+
+    final scale = math.min(availableWidth / 1080, availableHeight / 2300);
+
+    final dx = (availableWidth - 1080 * scale) / 2;
+    final dy = (availableHeight - 2300 * scale) / 2;
+
+    _zoomController.value = Matrix4.identity()
+      ..translate(dx, dy)
+      ..scale(scale);
   }
 
   void _rebuildActionLog() {
@@ -1361,6 +1384,34 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _pickAndAddImage() async {
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 500,
+      maxHeight: 500,
+      imageQuality: 70,
+    );
+    if (pickedFile == null) return;
+
+    try {
+      final bytes = await pickedFile.readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final width = frame.image.width.toDouble();
+      final height = frame.image.height.toDouble();
+
+      final x = (1080 - width) / 2;
+      final y = (2300 - height) / 2;
+
+      debugPrint('IMG: ${bytes.length} bytes, ${width}x$height');
+      await _addCanvasImage(base64Encode(bytes), x, y, width, height);
+      debugPrint('IMG: added');
+    } catch (e) {
+      debugPrint('Failed to pick image: $e');
+    }
+  }
+
   void _setupCursorSync() {
     _cursorChannel = Supabase.instance.client.channel(
       'cursors:${widget.roomCode}',
@@ -1693,9 +1744,14 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
                                         onLongPress: () =>
                                             _confirmDeleteImage(img),
                                         child: Image.memory(
-                                          base64Decode(img['image_data']),
+                                          _imageBytesCache.putIfAbsent(
+                                            img['id'],
+                                            () =>
+                                                base64Decode(img['image_data']),
+                                          ),
                                           width: img['width'],
                                           height: img['height'],
+                                          gaplessPlayback: true,
                                         ),
                                       ),
                                     ),
@@ -1876,22 +1932,27 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     ];
 
     return Container(
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.of(context).size.height * 0.5,
+      ),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: Colors.black87,
         borderRadius: BorderRadius.circular(16),
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final (tool, icon, label) in tools) ...[
-            _buildToolButton(tool, icon, label),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final (tool, icon, label) in tools) ...[
+              _buildToolButton(tool, icon, label),
+              const SizedBox(height: 8),
+            ],
+            _buildImageButton(),
             const SizedBox(height: 8),
+            _buildZoomButton(),
           ],
-          _buildLayersButton(),
-          const SizedBox(height: 8),
-          _buildZoomButton(),
-        ],
+        ),
       ),
     );
   }
@@ -1935,6 +1996,28 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
           borderRadius: BorderRadius.circular(12),
         ),
         child: const Icon(Icons.layers, color: Colors.white, size: 24),
+      ),
+    );
+  }
+
+  Widget _buildImageButton() {
+    return GestureDetector(
+      onTap: () {
+        setState(() => _toolsExpanded = false);
+        _pickAndAddImage();
+      },
+      child: Container(
+        width: 56,
+        height: 56,
+        decoration: BoxDecoration(
+          color: Colors.white12,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Icon(
+          Icons.add_photo_alternate,
+          color: Colors.white,
+          size: 24,
+        ),
       ),
     );
   }
