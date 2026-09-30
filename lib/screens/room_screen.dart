@@ -10,6 +10,8 @@ import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'dart:convert';
 import 'package:image_picker/image_picker.dart';
 import 'dart:typed_data';
+import 'package:livekit_client/livekit_client.dart' as lk;
+import 'package:permission_handler/permission_handler.dart';
 
 enum ToolType { brush, eraser, rectangle, circle, line, text, eyedropper, blur }
 
@@ -48,7 +50,7 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   bool _toolsExpanded = false;
   ToolType _currentTool = ToolType.brush;
   double _brushOpacity = 1.0;
-  final TransformationController _zoomController = TransformationController();
+  double _manualZoom = 1.0;
 
   Offset? _shapeStart;
   Offset? _shapeCurrent;
@@ -89,9 +91,13 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   ];
   double _brushSize = 4;
   bool _showOpacitySlider = false;
-  bool _hasAutoFitted = false;
-
   final Map<String, Uint8List> _imageBytesCache = {};
+
+  lk.Room? _liveKitRoom;
+  bool _inCall = false;
+  bool _isMuted = false;
+  bool _isConnectingToCall = false;
+  Map<String, bool> _remoteMutedStates = {};
 
   // --- LIFECYCLE ZONE ---
   @override
@@ -115,6 +121,10 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    // CHANGED: everything that touches the widget/mixin state now runs
+    // BEFORE super.dispose() — calling code after super.dispose() is unsafe.
+    _liveKitRoom?.disconnect();
+    WidgetsBinding.instance.removeObserver(this);
     _scribbleNotifier.removeListener(_onScribbleChanged);
     _scribbleNotifier.dispose();
     final supabase = Supabase.instance.client;
@@ -127,7 +137,6 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     _pendingTextFocusNode?.dispose();
     _textDeleteTimer?.cancel();
     super.dispose();
-    WidgetsBinding.instance.removeObserver(this);
   }
 
   // --- LOGIC ZONE ---
@@ -211,24 +220,6 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     );
     _isApplyingRemoteStroke = false;
     _knownLineCount = lines.length;
-  }
-
-  void _autoFitCanvas() {
-    if (_hasAutoFitted || !mounted) return;
-    _hasAutoFitted = true;
-
-    final screenSize = MediaQuery.of(context).size;
-    final availableWidth = screenSize.width;
-    final availableHeight = screenSize.height - 220;
-
-    final scale = math.min(availableWidth / 1080, availableHeight / 2300);
-
-    final dx = (availableWidth - 1080 * scale) / 2;
-    final dy = (availableHeight - 2300 * scale) / 2;
-
-    _zoomController.value = Matrix4.identity()
-      ..translate(dx, dy)
-      ..scale(scale);
   }
 
   void _rebuildActionLog() {
@@ -317,7 +308,6 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     );
 
     try {
-      // CHANGED: added await + try/catch so a failed insert is never silent
       await supabase.from('strokes').insert({
         'id': strokeId,
         'room_code': widget.roomCode,
@@ -627,10 +617,8 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
       case ToolType.rectangle:
       case ToolType.circle:
       case ToolType.line:
-        // Shape drawing logic — next category
         break;
       case ToolType.text:
-        // Text placement logic — next category
         break;
       case ToolType.eyedropper:
         break;
@@ -796,11 +784,7 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
 
       canvas.saveLayer(
         Rect.fromLTWH(0, 0, rect.width, rect.height),
-        Paint()
-          ..imageFilter = ui.ImageFilter.blur(
-            sigmaX: 13,
-            sigmaY: 13,
-          ), //heavier blur
+        Paint()..imageFilter = ui.ImageFilter.blur(sigmaX: 13, sigmaY: 13),
       );
       canvas.drawImageRect(
         fullImage,
@@ -1439,8 +1423,9 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   }
 
   void _handlePointerMove(PointerEvent event) {
-    if (_currentTool != ToolType.brush && _currentTool != ToolType.eraser)
+    if (_currentTool != ToolType.brush && _currentTool != ToolType.eraser) {
       return;
+    }
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastCursorSentAt < 50) return;
     _lastCursorSentAt = now;
@@ -1468,6 +1453,207 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     _cursorChannel?.sendBroadcastMessage(
       event: 'cursor_up',
       payload: {'user_id': userId},
+    );
+  }
+
+  // --- VOICE CALL (LiveKit) ---
+  Future<void> _joinCall({StateSetter? sheetSetState}) async {
+    if (_inCall || _isConnectingToCall) return;
+    setState(() => _isConnectingToCall = true);
+    sheetSetState?.call(() {});
+
+    try {
+      final micStatus = await Permission.microphone.request();
+      if (!micStatus.isGranted) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Microphone permission is needed to join the call'),
+          ),
+        );
+        setState(() => _isConnectingToCall = false);
+        sheetSetState?.call(() {});
+        return;
+      }
+
+      final supabase = Supabase.instance.client;
+      final userId = supabase.auth.currentUser!.id;
+
+      final response = await supabase.functions.invoke(
+        'generate-livekit-token',
+        body: {'room': widget.roomCode, 'identity': userId, 'name': _myName},
+      );
+
+      final token = response.data['token'] as String;
+
+      final room = lk.Room();
+      await room.connect('wss://inkly-jiy1l8ow.livekit.cloud', token);
+      await room.localParticipant?.setMicrophoneEnabled(true);
+
+      room.createListener().on<lk.RoomEvent>((event) {
+        if (mounted) setState(() {});
+        sheetSetState?.call(() {});
+      });
+
+      if (!mounted) return;
+      setState(() {
+        _liveKitRoom = room;
+        _inCall = true;
+        _isMuted = false;
+        _isConnectingToCall = false;
+      });
+      sheetSetState?.call(() {});
+    } catch (e) {
+      debugPrint('Failed to join call: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not join call: $e')));
+      setState(() => _isConnectingToCall = false);
+      sheetSetState?.call(() {});
+    }
+  }
+
+  Future<void> _leaveCall({StateSetter? sheetSetState}) async {
+    await _liveKitRoom?.disconnect();
+    if (!mounted) return;
+    setState(() {
+      _liveKitRoom = null;
+      _inCall = false;
+      _isMuted = false;
+    });
+    sheetSetState?.call(() {});
+  }
+
+  Future<void> _toggleMute({StateSetter? sheetSetState}) async {
+    final newMuted = !_isMuted;
+    await _liveKitRoom?.localParticipant?.setMicrophoneEnabled(!newMuted);
+    if (!mounted) return;
+    setState(() => _isMuted = newMuted);
+    sheetSetState?.call(() {});
+  }
+
+  void _showCallSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black87,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Voice Call',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    if (_isConnectingToCall) ...[
+                      const CircularProgressIndicator(color: Color(0xFF7C5CFF)),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Connecting...',
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                    ] else if (_inCall) ...[
+                      Wrap(
+                        spacing: 20,
+                        runSpacing: 16,
+                        alignment: WrapAlignment.center,
+                        children: [
+                          for (final user in _connectedUsers)
+                            _buildCallParticipantTile(user),
+                        ],
+                      ),
+                      const SizedBox(height: 28),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          IconButton(
+                            onPressed: () =>
+                                _toggleMute(sheetSetState: setSheetState),
+                            icon: Icon(
+                              _isMuted ? Icons.mic_off : Icons.mic,
+                              color: Colors.white,
+                            ),
+                            style: IconButton.styleFrom(
+                              backgroundColor: _isMuted
+                                  ? Colors.redAccent
+                                  : Colors.white12,
+                              padding: const EdgeInsets.all(16),
+                            ),
+                          ),
+                          const SizedBox(width: 24),
+                          IconButton(
+                            onPressed: () async {
+                              await _leaveCall(sheetSetState: setSheetState);
+                              if (sheetContext.mounted) {
+                                Navigator.of(sheetContext).pop();
+                              }
+                            },
+                            icon: const Icon(
+                              Icons.call_end,
+                              color: Colors.white,
+                            ),
+                            style: IconButton.styleFrom(
+                              backgroundColor: Colors.red,
+                              padding: const EdgeInsets.all(16),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ] else ...[
+                      const Text(
+                        'Start a voice call with everyone in the room',
+                        style: TextStyle(color: Colors.white70),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 20),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: () =>
+                              _joinCall(sheetSetState: setSheetState),
+                          icon: const Icon(Icons.call),
+                          label: const Text('Join Call'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF7C5CFF),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -1499,6 +1685,8 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
+                  // CHANGED: no external GestureDetector wrap here anymore —
+                  // _buildAvatarStack() now owns its own tap handler internally.
                   _buildAvatarStack(),
                   const SizedBox(width: 8),
                   IconButton(
@@ -1515,253 +1703,287 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
                     ),
                 ],
               ),
-            ),
+            ), //top bar
+
             Expanded(
               child: Container(
                 color: const Color(0xFFF5F5F5),
                 child: Stack(
                   children: [
                     Positioned.fill(
-                      child: InteractiveViewer(
-                        transformationController: _zoomController,
-                        minScale: 1.0,
-                        maxScale: 4.0,
-                        boundaryMargin: const EdgeInsets.all(double.infinity),
-                        child: Center(
-                          child: SizedBox(
-                            width: 1080,
-                            height: 2300,
-                            child: Listener(
-                              onPointerMove: _handlePointerMove,
-                              onPointerUp: _handlePointerUp,
-                              child: Stack(
-                                key: _canvasKey,
-                                children: [
-                                  Positioned.fill(
-                                    child: IgnorePointer(
-                                      ignoring:
-                                          _isShapeTool ||
-                                          _currentTool == ToolType.text ||
-                                          _currentTool == ToolType.eyedropper ||
-                                          _currentTool == ToolType.blur ||
-                                          _blockCanvasForText,
-                                      child: Scribble(
-                                        notifier: _scribbleNotifier,
-                                        drawPen: true,
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final fitScale = math.min(
+                            constraints.maxWidth / 1080,
+                            constraints.maxHeight / 2300,
+                          );
+                          final totalScale = fitScale * _manualZoom;
+                          final left =
+                              (constraints.maxWidth - 1080 * totalScale) / 2;
+                          final top =
+                              (constraints.maxHeight - 2300 * totalScale) / 2;
+
+                          return Transform.translate(
+                            offset: Offset(left, top),
+                            child: Transform.scale(
+                              scale: totalScale,
+                              alignment: Alignment.topLeft,
+                              child: SizedBox(
+                                width: 1080,
+                                height: 2300,
+                                child: Listener(
+                                  onPointerMove: _handlePointerMove,
+                                  onPointerUp: _handlePointerUp,
+                                  child: Stack(
+                                    key: _canvasKey,
+                                    children: [
+                                      Positioned.fill(
+                                        child: IgnorePointer(
+                                          ignoring:
+                                              _isShapeTool ||
+                                              _currentTool == ToolType.text ||
+                                              _currentTool ==
+                                                  ToolType.eyedropper ||
+                                              _currentTool == ToolType.blur ||
+                                              _blockCanvasForText,
+                                          child: Scribble(
+                                            notifier: _scribbleNotifier,
+                                            drawPen: true,
+                                          ),
+                                        ),
                                       ),
-                                    ),
-                                  ),
-                                  if (_isShapeTool)
-                                    Positioned.fill(
-                                      child: GestureDetector(
-                                        onPanStart: (details) =>
-                                            _startShape(details.localPosition),
-                                        onPanUpdate: (details) =>
-                                            _updateShape(details.localPosition),
-                                        onPanEnd: (_) => _finishShape(),
-                                        child: CustomPaint(
-                                          painter: _ShapePreviewPainter(
-                                            tool: _currentTool,
-                                            start: _shapeStart,
-                                            current: _shapeCurrent,
-                                            color: Color(
-                                              int.parse(
-                                                _myColorHex.replaceFirst(
-                                                  '#',
-                                                  '0xFF',
+                                      if (_isShapeTool)
+                                        Positioned.fill(
+                                          child: GestureDetector(
+                                            onPanStart: (details) =>
+                                                _startShape(
+                                                  details.localPosition,
+                                                ),
+                                            onPanUpdate: (details) =>
+                                                _updateShape(
+                                                  details.localPosition,
+                                                ),
+                                            onPanEnd: (_) => _finishShape(),
+                                            child: CustomPaint(
+                                              painter: _ShapePreviewPainter(
+                                                tool: _currentTool,
+                                                start: _shapeStart,
+                                                current: _shapeCurrent,
+                                                color: Color(
+                                                  int.parse(
+                                                    _myColorHex.replaceFirst(
+                                                      '#',
+                                                      '0xFF',
+                                                    ),
+                                                  ),
                                                 ),
                                               ),
                                             ),
                                           ),
                                         ),
-                                      ),
-                                    ),
-                                  if (_currentTool == ToolType.blur)
-                                    Positioned.fill(
-                                      child: GestureDetector(
-                                        onPanStart: (details) => setState(() {
-                                          _blurStart = details.localPosition;
-                                          _blurCurrent = details.localPosition;
-                                        }),
-                                        onPanUpdate: (details) => setState(() {
-                                          _blurCurrent = details.localPosition;
-                                        }),
-                                        onPanEnd: (_) {
-                                          if (_blurStart != null &&
-                                              _blurCurrent != null) {
-                                            _applyBlurToRegion(
-                                              _blurStart!,
-                                              _blurCurrent!,
-                                            );
-                                          }
-                                          setState(() {
-                                            _blurStart = null;
-                                            _blurCurrent = null;
-                                          });
-                                        },
-                                        child: CustomPaint(
-                                          painter: _ShapePreviewPainter(
-                                            tool: ToolType.rectangle,
-                                            start: _blurStart,
-                                            current: _blurCurrent,
-                                            color: Colors.white54,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  if (_currentTool == ToolType.text)
-                                    Positioned.fill(
-                                      child: GestureDetector(
-                                        onTapUp: (details) => _handleTextTap(
-                                          details.localPosition,
-                                        ),
-                                      ),
-                                    ),
-                                  if (_currentTool == ToolType.eyedropper)
-                                    Positioned.fill(
-                                      child: GestureDetector(
-                                        onTapUp: (details) =>
-                                            _pickColorAt(details.localPosition),
-                                      ),
-                                    ),
-                                  if (_pendingTextPosition != null)
-                                    Positioned(
-                                      left: _pendingTextPosition!.dx,
-                                      top: _pendingTextPosition!.dy,
-                                      child: IntrinsicWidth(
-                                        child: TextField(
-                                          controller: _pendingTextController,
-                                          focusNode: _pendingTextFocusNode,
-                                          autofocus: true,
-                                          style: TextStyle(
-                                            color: Color(
-                                              int.parse(
-                                                _myColorHex.replaceFirst(
-                                                  '#',
-                                                  '0xFF',
-                                                ),
+                                      if (_currentTool == ToolType.blur)
+                                        Positioned.fill(
+                                          child: GestureDetector(
+                                            onPanStart: (details) =>
+                                                setState(() {
+                                                  _blurStart =
+                                                      details.localPosition;
+                                                  _blurCurrent =
+                                                      details.localPosition;
+                                                }),
+                                            onPanUpdate: (details) =>
+                                                setState(() {
+                                                  _blurCurrent =
+                                                      details.localPosition;
+                                                }),
+                                            onPanEnd: (_) {
+                                              if (_blurStart != null &&
+                                                  _blurCurrent != null) {
+                                                _applyBlurToRegion(
+                                                  _blurStart!,
+                                                  _blurCurrent!,
+                                                );
+                                              }
+                                              setState(() {
+                                                _blurStart = null;
+                                                _blurCurrent = null;
+                                              });
+                                            },
+                                            child: CustomPaint(
+                                              painter: _ShapePreviewPainter(
+                                                tool: ToolType.rectangle,
+                                                start: _blurStart,
+                                                current: _blurCurrent,
+                                                color: Colors.white54,
                                               ),
                                             ),
-                                            fontSize: 32,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                          decoration: const InputDecoration(
-                                            border: InputBorder.none,
-                                            isDense: true,
                                           ),
                                         ),
-                                      ),
-                                    ),
-                                  for (final text in _canvasTexts)
-                                    Positioned(
-                                      left: text['pos_x'],
-                                      top: text['pos_y'],
-                                      child: Listener(
-                                        behavior: HitTestBehavior.opaque,
-                                        onPointerDown: (event) {
-                                          setState(
-                                            () => _blockCanvasForText = true,
-                                          );
-                                          _draggingTextId = text['id'];
-                                          _dragOriginalPosition = Offset(
-                                            text['pos_x'],
-                                            text['pos_y'],
-                                          );
-                                          _textDidMove = false;
-                                          _textDeleteTimer?.cancel();
-                                          _textDeleteTimer = Timer(
-                                            const Duration(milliseconds: 500),
-                                            () {
-                                              if (_draggingTextId ==
-                                                      text['id'] &&
-                                                  !_textDidMove) {
-                                                _confirmDeleteText(text);
+                                      if (_currentTool == ToolType.text)
+                                        Positioned.fill(
+                                          child: GestureDetector(
+                                            onTapUp: (details) =>
+                                                _handleTextTap(
+                                                  details.localPosition,
+                                                ),
+                                          ),
+                                        ),
+                                      if (_currentTool == ToolType.eyedropper)
+                                        Positioned.fill(
+                                          child: GestureDetector(
+                                            onTapUp: (details) => _pickColorAt(
+                                              details.localPosition,
+                                            ),
+                                          ),
+                                        ),
+                                      if (_pendingTextPosition != null)
+                                        Positioned(
+                                          left: _pendingTextPosition!.dx,
+                                          top: _pendingTextPosition!.dy,
+                                          child: IntrinsicWidth(
+                                            child: TextField(
+                                              controller:
+                                                  _pendingTextController,
+                                              focusNode: _pendingTextFocusNode,
+                                              autofocus: true,
+                                              style: TextStyle(
+                                                color: Color(
+                                                  int.parse(
+                                                    _myColorHex.replaceFirst(
+                                                      '#',
+                                                      '0xFF',
+                                                    ),
+                                                  ),
+                                                ),
+                                                fontSize: 32,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                              decoration: const InputDecoration(
+                                                border: InputBorder.none,
+                                                isDense: true,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      for (final text in _canvasTexts)
+                                        Positioned(
+                                          left: text['pos_x'],
+                                          top: text['pos_y'],
+                                          child: Listener(
+                                            behavior: HitTestBehavior.opaque,
+                                            onPointerDown: (event) {
+                                              setState(
+                                                () =>
+                                                    _blockCanvasForText = true,
+                                              );
+                                              _draggingTextId = text['id'];
+                                              _dragOriginalPosition = Offset(
+                                                text['pos_x'],
+                                                text['pos_y'],
+                                              );
+                                              _textDidMove = false;
+                                              _textDeleteTimer?.cancel();
+                                              _textDeleteTimer = Timer(
+                                                const Duration(
+                                                  milliseconds: 500,
+                                                ),
+                                                () {
+                                                  if (_draggingTextId ==
+                                                          text['id'] &&
+                                                      !_textDidMove) {
+                                                    _confirmDeleteText(text);
+                                                  }
+                                                },
+                                              );
+                                            },
+                                            onPointerMove: (event) {
+                                              if (_draggingTextId != text['id'])
+                                                return;
+                                              if (!_textDidMove &&
+                                                  event.delta.distance > 2) {
+                                                _textDidMove = true;
+                                                _textDeleteTimer?.cancel();
+                                              }
+                                              if (_textDidMove) {
+                                                final current = Offset(
+                                                  text['pos_x'],
+                                                  text['pos_y'],
+                                                );
+                                                _moveText(
+                                                  text['id'],
+                                                  current + event.delta,
+                                                );
                                               }
                                             },
-                                          );
-                                        },
-                                        onPointerMove: (event) {
-                                          if (_draggingTextId != text['id'])
-                                            return;
-                                          if (!_textDidMove &&
-                                              event.delta.distance > 2) {
-                                            _textDidMove = true;
-                                            _textDeleteTimer?.cancel();
-                                          }
-                                          if (_textDidMove) {
-                                            final current = Offset(
-                                              text['pos_x'],
-                                              text['pos_y'],
-                                            );
-                                            _moveText(
-                                              text['id'],
-                                              current + event.delta,
-                                            );
-                                          }
-                                        },
-                                        onPointerUp: (event) {
-                                          _textDeleteTimer?.cancel();
-                                          _draggingTextId = null;
-                                          setState(
-                                            () => _blockCanvasForText = false,
-                                          );
-                                        },
-                                        onPointerCancel: (event) {
-                                          _textDeleteTimer?.cancel();
-                                          _draggingTextId = null;
-                                          setState(
-                                            () => _blockCanvasForText = false,
-                                          );
-                                        },
-                                        child: Container(
-                                          padding: const EdgeInsets.all(12),
-                                          child: Text(
-                                            text['content'],
-                                            style: TextStyle(
-                                              color: Color(
-                                                int.parse(
-                                                  (text['color'] as String)
-                                                      .replaceFirst(
-                                                        '#',
-                                                        '0xFF',
-                                                      ),
+                                            onPointerUp: (event) {
+                                              _textDeleteTimer?.cancel();
+                                              _draggingTextId = null;
+                                              setState(
+                                                () =>
+                                                    _blockCanvasForText = false,
+                                              );
+                                            },
+                                            onPointerCancel: (event) {
+                                              _textDeleteTimer?.cancel();
+                                              _draggingTextId = null;
+                                              setState(
+                                                () =>
+                                                    _blockCanvasForText = false,
+                                              );
+                                            },
+                                            child: Container(
+                                              padding: const EdgeInsets.all(12),
+                                              child: Text(
+                                                text['content'],
+                                                style: TextStyle(
+                                                  color: Color(
+                                                    int.parse(
+                                                      (text['color'] as String)
+                                                          .replaceFirst(
+                                                            '#',
+                                                            '0xFF',
+                                                          ),
+                                                    ),
+                                                  ),
+                                                  fontSize:
+                                                      (text['font_size'] ?? 32)
+                                                          .toDouble(),
+                                                  fontWeight: FontWeight.bold,
                                                 ),
                                               ),
-                                              fontSize:
-                                                  (text['font_size'] ?? 32)
-                                                      .toDouble(),
-                                              fontWeight: FontWeight.bold,
                                             ),
                                           ),
                                         ),
-                                      ),
-                                    ),
-                                  for (final img in _canvasImages)
-                                    Positioned(
-                                      left: img['pos_x'],
-                                      top: img['pos_y'],
-                                      child: GestureDetector(
-                                        onLongPress: () =>
-                                            _confirmDeleteImage(img),
-                                        child: Image.memory(
-                                          _imageBytesCache.putIfAbsent(
-                                            img['id'],
-                                            () =>
-                                                base64Decode(img['image_data']),
+                                      for (final img in _canvasImages)
+                                        Positioned(
+                                          left: img['pos_x'],
+                                          top: img['pos_y'],
+                                          child: GestureDetector(
+                                            onLongPress: () =>
+                                                _confirmDeleteImage(img),
+                                            child: Image.memory(
+                                              _imageBytesCache.putIfAbsent(
+                                                img['id'],
+                                                () => base64Decode(
+                                                  img['image_data'],
+                                                ),
+                                              ),
+                                              width: img['width'],
+                                              height: img['height'],
+                                              gaplessPlayback: true,
+                                            ),
                                           ),
-                                          width: img['width'],
-                                          height: img['height'],
-                                          gaplessPlayback: true,
                                         ),
-                                      ),
-                                    ),
-                                  for (final entry in _remoteCursors.entries)
-                                    _buildRemoteCursor(entry.value),
-                                ],
+                                      for (final entry
+                                          in _remoteCursors.entries)
+                                        _buildRemoteCursor(entry.value),
+                                    ],
+                                  ),
+                                ),
                               ),
                             ),
-                          ),
-                        ),
+                          );
+                        },
                       ),
                     ),
                     Positioned(
@@ -2004,7 +2226,9 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     return GestureDetector(
       onTap: () {
         setState(() => _toolsExpanded = false);
-        _pickAndAddImage();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Add image — coming soon')),
+        );
       },
       child: Container(
         width: 56,
@@ -2024,12 +2248,7 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
 
   Widget _buildZoomButton() {
     return GestureDetector(
-      onTap: () {
-        final isZoomedIn = _zoomController.value.getMaxScaleOnAxis() > 1.5;
-        _zoomController.value = isZoomedIn
-            ? Matrix4.identity()
-            : (Matrix4.identity()..scale(2.0));
-      },
+      onTap: () => setState(() => _manualZoom = _manualZoom > 1.5 ? 1.0 : 2.0),
       child: Container(
         width: 56,
         height: 56,
@@ -2079,6 +2298,10 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     );
   }
 
+  // CHANGED: this widget now owns the tap-to-open-call gesture itself,
+  // wrapping its OWN return value — never wrapped externally in build().
+  // That external wrap was what triggered "Incorrect use of ParentDataWidget",
+  // since the Positioned children here expect a direct Stack parent.
   Widget _buildAvatarStack() {
     const maxVisible = 3;
     final visibleUsers = _connectedUsers.take(maxVisible).toList();
@@ -2087,41 +2310,54 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     final avatarCount = visibleUsers.length + (overflowCount > 0 ? 1 : 0);
     final stackWidth = 32 + ((avatarCount - 1).clamp(0, 10) * 24.0);
 
-    return SizedBox(
-      height: 36,
-      width: stackWidth,
-      child: Stack(
-        children: [
-          for (int i = 0; i < visibleUsers.length; i++)
-            Positioned(
-              right: i * 24.0,
-              child: _buildAvatarCircle(
-                name: visibleUsers[i]['display_name'] ?? '?',
-                colorHex: visibleUsers[i]['avatar_color'] ?? '#7C5CFF',
-              ),
-            ),
-          if (overflowCount > 0)
-            Positioned(
-              right: visibleUsers.length * 24.0,
-              child: Container(
-                width: 32,
-                height: 32,
-                decoration: const BoxDecoration(
-                  color: Colors.white24,
-                  shape: BoxShape.circle,
+    return GestureDetector(
+      onTap: _showCallSheet,
+      child: SizedBox(
+        height: 36,
+        width: stackWidth + (_inCall ? 14 : 0),
+        child: Stack(
+          children: [
+            for (int i = 0; i < visibleUsers.length; i++)
+              Positioned(
+                right: i * 24.0 + (_inCall ? 14 : 0),
+                child: _buildAvatarCircle(
+                  name: visibleUsers[i]['display_name'] ?? '?',
+                  colorHex: visibleUsers[i]['avatar_color'] ?? '#7C5CFF',
                 ),
-                alignment: Alignment.center,
-                child: Text(
-                  '+$overflowCount',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
+              ),
+            if (overflowCount > 0)
+              Positioned(
+                right: visibleUsers.length * 24.0 + (_inCall ? 14 : 0),
+                child: Container(
+                  width: 32,
+                  height: 32,
+                  decoration: const BoxDecoration(
+                    color: Colors.white24,
+                    shape: BoxShape.circle,
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    '+$overflowCount',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
               ),
-            ),
-        ],
+            if (_inCall)
+              const Positioned(
+                left: 0,
+                top: 0,
+                child: CircleAvatar(
+                  radius: 7,
+                  backgroundColor: Color(0xFF34C759),
+                  child: Icon(Icons.call, color: Colors.white, size: 9),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -2145,6 +2381,71 @@ class _RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
           fontSize: 12,
           fontWeight: FontWeight.bold,
         ),
+      ),
+    );
+  }
+
+  Widget _buildCallParticipantTile(Map<String, dynamic> user) {
+    final name = user['display_name'] ?? '?';
+    final colorHex = user['avatar_color'] ?? '#7C5CFF';
+    final isMe =
+        user['user_id'] == Supabase.instance.client.auth.currentUser?.id;
+    final showMuted = isMe && _isMuted;
+
+    return SizedBox(
+      width: 64,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Container(
+                width: 52,
+                height: 52,
+                decoration: BoxDecoration(
+                  color: Color(int.parse(colorHex.replaceFirst('#', '0xFF'))),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: const Color(0xFF34C759), width: 2),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  name.isNotEmpty ? name[0].toUpperCase() : '?',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              if (showMuted)
+                Positioned(
+                  right: -2,
+                  bottom: -2,
+                  child: Container(
+                    padding: const EdgeInsets.all(3),
+                    decoration: const BoxDecoration(
+                      color: Colors.redAccent,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.mic_off,
+                      color: Colors.white,
+                      size: 11,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 11),
+          ),
+        ],
       ),
     );
   }
